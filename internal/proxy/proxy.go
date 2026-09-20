@@ -43,7 +43,13 @@ func NewDirectOriginClient(timeout time.Duration) *HTTPOriginClient {
 	if timeout <= 0 {
 		timeout = 45 * time.Second
 	}
-	return &HTTPOriginClient{client: &http.Client{Transport: transport, Timeout: timeout}}
+	return &HTTPOriginClient{client: &http.Client{
+		Transport: transport,
+		Timeout:   timeout,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}}
 }
 
 func (c *HTTPOriginClient) Do(ctx context.Context, req *http.Request) (*http.Response, error) {

@@ -249,6 +249,10 @@ function App() {
       notify('请通过 Wails 应用运行，浏览器预览没有后端服务。', 'error')
       return
     }
+    if (snapshot.state === 'migrating') {
+      notify('缓存迁移正在进行，请在“缓存”页面暂停或取消迁移。', 'info')
+      return
+    }
     setBusy(true)
     try {
       const wasRunning = snapshot.state === 'running'
@@ -337,9 +341,9 @@ function App() {
               <span className="status-dot" />
               {stateLabel(snapshot.state)}
             </span>
-            <button className="service-button" onClick={() => void toggleService()} disabled={busy}>
-              {snapshot.state === 'running' ? <Square size={15} /> : <Play size={15} />}
-              {snapshot.state === 'running' ? '停止服务' : '启动服务'}
+            <button className="service-button" onClick={() => void toggleService()} disabled={busy || snapshot.state === 'migrating'}>
+              {snapshot.state === 'running' || snapshot.state === 'migrating' ? <Square size={15} /> : <Play size={15} />}
+              {snapshot.state === 'migrating' ? '迁移中（服务运行）' : snapshot.state === 'running' ? '停止服务' : '启动服务'}
             </button>
           </div>
         </header>
@@ -471,7 +475,7 @@ function CachePage({ snapshot, backend, onNotify, onRefresh, onOpenCacheFolder }
       </div>
       <div className="action-row">
         <button className="secondary-button" onClick={onOpenCacheFolder}><FolderOpen size={16} />打开缓存目录</button>
-        <button className="secondary-button" onClick={() => void chooseRoot()} disabled={working || migration.state === 'running'}><ExternalLink size={16} />更改缓存位置</button>
+        <button className="secondary-button" onClick={() => void chooseRoot()} disabled={working || migration.state === 'running' || migration.state === 'paused'}><ExternalLink size={16} />更改缓存位置</button>
         <button className="secondary-button" onClick={() => void inspect()} disabled={working}><Wrench size={16} />体检缓存</button>
         <button className="secondary-button danger-button" onClick={() => void clear()} disabled={working}><Trash2 size={16} />清理缓存</button>
       </div>
@@ -621,7 +625,7 @@ function SettingsPage({ snapshot, backend, theme, onThemeChange, onOpenConfigFol
     }
   }
 
-  return <div className="page-grid"><section className="panel large-panel settings-panel"><div className="panel-heading"><div><span className="section-label">APPLICATION</span><h2>设置</h2></div></div><div className="detail-list"><div><span>版本</span><strong>1.0.3</strong></div><div className="setting-edit-row"><div><span>本地代理端口</span><small>监听地址固定为 127.0.0.1；修改后请同步 ZeroOmega 端口。</small></div><div className="port-control"><span>127.0.0.1:</span><input aria-label="本地代理端口" className="setting-input" type="number" min={1} max={65535} value={portValue} onChange={(event) => { setPortValue(event.target.value); setPortDirty(true) }} /><button className="secondary-button" onClick={() => void applyPort()} disabled={portWorking || !portDirty}>{portWorking ? '应用中…' : '应用'}</button></div></div><div><span>缓存路径</span><strong title={snapshot.cache_root}>{snapshot.cache_root || '—'}</strong></div><div><span>配置文件</span><strong>%LOCALAPPDATA%\GBFLocalCache\config.json</strong></div></div><div className="setting-list"><div className="setting-row"><div><strong>开机自启</strong><small>登录 Windows 后自动启动服务，并隐藏到右下角托盘。</small></div><button className={`switch-control ${startupEnabled ? 'active' : ''}`} role="switch" aria-checked={startupEnabled} onClick={() => void toggleStartup()} disabled={startupWorking}><span /></button></div><div className="setting-row"><div><strong>关闭窗口</strong><small>{closeBehavior === 'tray' ? '点击右上角 X 隐藏到系统托盘，服务继续运行。' : '点击右上角 X 退出程序并停止服务。'}</small></div><select aria-label="关闭窗口行为" className="setting-select" value={closeBehavior} onChange={(event) => void changeCloseBehavior(event.target.value as 'tray' | 'exit')} disabled={closeWorking}><option value="tray">隐藏到托盘</option><option value="exit">退出程序</option></select></div></div><div className="action-row"><button className="secondary-button" onClick={onOpenConfigFolder}><ExternalLink size={16} />打开配置目录</button><button className="secondary-button" onClick={onThemeChange}>{theme === 'light' ? <Moon size={16} /> : <Sun size={16} />}{theme === 'light' ? '切换深色主题' : '切换浅色主题'}</button><button className="secondary-button" onClick={() => onNotify('配置写入采用临时文件、flush、fsync 后原子替换。', 'success')}><Settings size={16} />配置说明</button><button className="secondary-button" onClick={openFeedback}><Github size={16} />提交反馈</button></div></section></div>
+  return <div className="page-grid"><section className="panel large-panel settings-panel"><div className="panel-heading"><div><span className="section-label">APPLICATION</span><h2>设置</h2></div></div><div className="detail-list"><div><span>版本</span><strong>1.0.4</strong></div><div className="setting-edit-row"><div><span>本地代理端口</span><small>监听地址固定为 127.0.0.1；修改后请同步 ZeroOmega 端口。</small></div><div className="port-control"><span>127.0.0.1:</span><input aria-label="本地代理端口" className="setting-input" type="number" min={1} max={65535} value={portValue} onChange={(event) => { setPortValue(event.target.value); setPortDirty(true) }} /><button className="secondary-button" onClick={() => void applyPort()} disabled={portWorking || !portDirty}>{portWorking ? '应用中…' : '应用'}</button></div></div><div><span>缓存路径</span><strong title={snapshot.cache_root}>{snapshot.cache_root || '—'}</strong></div><div><span>配置文件</span><strong>%LOCALAPPDATA%\GBFLocalCache\config.json</strong></div></div><div className="setting-list"><div className="setting-row"><div><strong>开机自启</strong><small>登录 Windows 后自动启动服务，并隐藏到右下角托盘。</small></div><button className={`switch-control ${startupEnabled ? 'active' : ''}`} role="switch" aria-checked={startupEnabled} onClick={() => void toggleStartup()} disabled={startupWorking}><span /></button></div><div className="setting-row"><div><strong>关闭窗口</strong><small>{closeBehavior === 'tray' ? '点击右上角 X 隐藏到系统托盘，服务继续运行。' : '点击右上角 X 退出程序并停止服务。'}</small></div><select aria-label="关闭窗口行为" className="setting-select" value={closeBehavior} onChange={(event) => void changeCloseBehavior(event.target.value as 'tray' | 'exit')} disabled={closeWorking}><option value="tray">隐藏到托盘</option><option value="exit">退出程序</option></select></div></div><div className="action-row"><button className="secondary-button" onClick={onOpenConfigFolder}><ExternalLink size={16} />打开配置目录</button><button className="secondary-button" onClick={onThemeChange}>{theme === 'light' ? <Moon size={16} /> : <Sun size={16} />}{theme === 'light' ? '切换深色主题' : '切换浅色主题'}</button><button className="secondary-button" onClick={() => onNotify('配置写入采用临时文件、flush、fsync 后原子替换。', 'success')}><Settings size={16} />配置说明</button><button className="secondary-button" onClick={openFeedback}><Github size={16} />提交反馈</button></div></section></div>
 }
 
 export default App

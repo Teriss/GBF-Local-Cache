@@ -175,7 +175,16 @@ func buildHolder(cfg config.Config) (*clientHolder, error) {
 	default:
 		return nil, fmt.Errorf("unsupported network mode %q", cfg.NetworkMode)
 	}
-	client := &http.Client{Transport: transport, Timeout: 45 * time.Second}
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   45 * time.Second,
+		// Redirects must be returned to the browser. Following a Location
+		// here could make the origin client connect to a host that was not
+		// admitted by the local CDN whitelist.
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 	return &clientHolder{client: client, close: transport.CloseIdleConnections}, nil
 }
 

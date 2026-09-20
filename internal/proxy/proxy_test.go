@@ -103,6 +103,37 @@ func TestPlainHTTPProxyForwardsOnlyWhitelistedStaticHosts(t *testing.T) {
 	}
 }
 
+func TestDirectOriginClientDoesNotFollowRedirects(t *testing.T) {
+	var destinationRequests atomic.Int64
+	destination := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		destinationRequests.Add(1)
+		writer.WriteHeader(http.StatusOK)
+	}))
+	defer destination.Close()
+	redirect := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		http.Redirect(writer, request, destination.URL, http.StatusFound)
+	}))
+	defer redirect.Close()
+
+	client := NewDirectOriginClient(time.Second)
+	defer client.CloseIdleConnections()
+	request, err := http.NewRequest(http.MethodGet, redirect.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := client.Do(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusFound {
+		t.Fatalf("redirect status = %d, want %d", response.StatusCode, http.StatusFound)
+	}
+	if got := destinationRequests.Load(); got != 0 {
+		t.Fatalf("redirect destination received %d requests", got)
+	}
+}
+
 func TestListenerRoundTripUsesLoopbackOnlyProxy(t *testing.T) {
 	origin := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		_, _ = writer.Write([]byte("fake cdn"))

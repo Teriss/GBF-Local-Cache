@@ -66,6 +66,7 @@ type Service struct {
 	serviceCancel   context.CancelFunc
 	migrationCtx    context.Context
 	migrationCancel context.CancelFunc
+	configChanged   func(config.Config)
 }
 
 func New(cfg config.Config) (*Service, error) {
@@ -109,6 +110,9 @@ func (s *Service) Start(ctx context.Context) error {
 		migrationCtx = context.Background()
 	}
 	s.mu.Unlock()
+	if reconciled := s.reconcileCompletedMigration(cfg); reconciled.CacheRoot != cfg.CacheRoot {
+		cfg = reconciled
+	}
 	failStart := func(err error) error {
 		serviceCancel()
 		return s.startFailure(err)
@@ -180,13 +184,7 @@ func (s *Service) Start(ctx context.Context) error {
 	s.mu.Unlock()
 	s.logs.Add(logging.Entry{Category: logging.CategoryNetwork, Message: "service started on " + listener.Address()})
 	resumeCallback := func(status migration.Status) {
-		s.mu.Lock()
-		if status.State == migration.StateCompleted {
-			s.config.CacheRoot = status.NewRoot
-		} else if status.State == migration.StateCanceled || status.State == migration.StateError {
-			s.config.CacheRoot = status.OldRoot
-		}
-		s.mu.Unlock()
+		s.applyMigrationConfig(status)
 	}
 	if activeMigration != nil {
 		return nil
@@ -366,6 +364,55 @@ func (s *Service) SetConfig(cfg config.Config) error {
 	return nil
 }
 
+// SetConfigChangedCallback installs a best-effort persistence hook for
+// asynchronous changes such as migration completion. The callback is always
+// invoked outside the service mutex.
+func (s *Service) SetConfigChangedCallback(callback func(config.Config)) {
+	s.mu.Lock()
+	s.configChanged = callback
+	s.mu.Unlock()
+}
+
+func (s *Service) applyMigrationConfig(status migration.Status) {
+	if status.State != migration.StateCompleted && status.State != migration.StateCanceled && status.State != migration.StateError {
+		return
+	}
+	s.mu.Lock()
+	if status.State == migration.StateCompleted {
+		s.config.CacheRoot = status.NewRoot
+	} else {
+		s.config.CacheRoot = status.OldRoot
+	}
+	cfg := cloneConfig(s.config)
+	callback := s.configChanged
+	s.mu.Unlock()
+	if callback != nil {
+		callback(cfg)
+	}
+}
+
+func (s *Service) reconcileCompletedMigration(cfg config.Config) config.Config {
+	newRoot, ok, err := migration.CompletedRoot(cfg.CacheRoot)
+	if err != nil {
+		s.logs.Add(logging.Entry{Category: logging.CategoryError, Message: "completed migration reconciliation skipped: " + err.Error()})
+		return cfg
+	}
+	if !ok {
+		return cfg
+	}
+	cfg.CacheRoot = newRoot
+	s.mu.Lock()
+	s.config.CacheRoot = newRoot
+	callback := s.configChanged
+	persisted := cloneConfig(s.config)
+	s.mu.Unlock()
+	if callback != nil {
+		callback(persisted)
+	}
+	s.logs.Add(logging.Entry{Category: logging.CategoryMigration, Message: "reconciled completed cache migration to " + newRoot})
+	return cfg
+}
+
 // ChangeListenPort rebinds the loopback listener without rebuilding the
 // origin network, cache manager, certificate manager, or migration state.
 func (s *Service) ChangeListenPort(ctx context.Context, port int) error {
@@ -531,10 +578,14 @@ func (s *Service) ChangeCacheRoot(ctx context.Context, newRoot string) error {
 	if err := os.MkdirAll(oldRoot, 0o700); err != nil {
 		return fmt.Errorf("create current cache root: %w", err)
 	}
+	var releaseWrites func()
 	if manager != nil {
-		if err := manager.Wait(ctx); err != nil {
+		var err error
+		releaseWrites, err = manager.BeginRootTransition(ctx)
+		if err != nil {
 			return err
 		}
+		defer releaseWrites()
 	}
 	if err := os.MkdirAll(filepath.Dir(newRoot), 0o700); err != nil {
 		return err
@@ -567,13 +618,7 @@ func (s *Service) ChangeCacheRoot(ctx context.Context, newRoot string) error {
 		s.mu.Unlock()
 	}
 	callback := func(status migration.Status) {
-		s.mu.Lock()
-		if status.State == migration.StateCompleted {
-			s.config.CacheRoot = newRoot
-		} else if status.State == migration.StateCanceled || status.State == migration.StateError {
-			s.config.CacheRoot = oldRoot
-		}
-		s.mu.Unlock()
+		s.applyMigrationConfig(status)
 	}
 	if err := migrator.StartWithWorker(ctx, migrationCtx, oldRoot, newRoot, callback); err != nil {
 		return err
@@ -585,7 +630,12 @@ func (s *Service) ChangeCacheRoot(ctx context.Context, newRoot string) error {
 func (s *Service) setCacheRoot(root string) {
 	s.mu.Lock()
 	s.config.CacheRoot = root
+	cfg := cloneConfig(s.config)
+	callback := s.configChanged
 	s.mu.Unlock()
+	if callback != nil {
+		callback(cfg)
+	}
 }
 
 func (s *Service) PauseMigration() error {

@@ -14,6 +14,7 @@ import (
 	"gbf-local-cache/internal/cache"
 	"gbf-local-cache/internal/cert"
 	"gbf-local-cache/internal/config"
+	"gbf-local-cache/internal/logging"
 	"gbf-local-cache/internal/migration"
 	"gbf-local-cache/internal/service"
 
@@ -71,6 +72,11 @@ func NewApp() *App {
 
 	app.config = cfg
 	app.service = svc
+	svc.SetConfigChangedCallback(func(changed config.Config) {
+		if err := app.syncPersistedConfig(changed); err != nil {
+			svc.Logs().Add(logging.Entry{Category: logging.CategoryError, Message: err.Error()})
+		}
+	})
 	return app
 }
 
@@ -144,7 +150,7 @@ func (a *App) Snapshot() service.Snapshot {
 		return service.Snapshot{State: service.StateError, Error: initErr}
 	}
 	snapshot := svc.Snapshot()
-	a.syncPersistedConfig(svc.Config())
+	_ = a.syncPersistedConfig(svc.Config())
 	if initErr != "" {
 		snapshot.State = service.StateError
 		snapshot.Error = initErr
@@ -319,8 +325,7 @@ func (a *App) ChangeCacheRoot(root string) error {
 	if err := svc.ChangeCacheRoot(changeContext, root); err != nil {
 		return err
 	}
-	a.syncPersistedConfig(svc.Config())
-	return nil
+	return a.syncPersistedConfig(svc.Config())
 }
 
 func (a *App) PauseMigration() error {
@@ -374,8 +379,7 @@ func (a *App) SetNetworkMode(mode string, protocol string, host string, port int
 	}); err != nil {
 		return err
 	}
-	a.syncPersistedConfig(svc.Config())
-	return nil
+	return a.syncPersistedConfig(svc.Config())
 }
 
 func (a *App) InstallCertificate() error {
@@ -447,8 +451,7 @@ func (a *App) SetCloseBehavior(behavior string) error {
 	if err := svc.SetConfig(cfg); err != nil {
 		return err
 	}
-	a.syncPersistedConfig(cfg)
-	return nil
+	return a.syncPersistedConfig(cfg)
 }
 
 // SetListenPort changes the loopback proxy port and persists it. When the
@@ -470,8 +473,7 @@ func (a *App) SetListenPort(port int) error {
 	if err := svc.ChangeListenPort(changeContext, port); err != nil {
 		return err
 	}
-	a.syncPersistedConfig(svc.Config())
-	return nil
+	return a.syncPersistedConfig(svc.Config())
 }
 
 func (a *App) CertificateStatus() cert.Status {
@@ -484,18 +486,24 @@ func (a *App) MigrationStatus() migration.Status {
 	return snapshot.Migration
 }
 
-func (a *App) syncPersistedConfig(cfg config.Config) {
-	a.mu.Lock()
-	if reflect.DeepEqual(a.config, cfg) {
-		a.mu.Unlock()
-		return
+func (a *App) syncPersistedConfig(cfg config.Config) error {
+	a.mu.RLock()
+	unchanged := reflect.DeepEqual(a.config, cfg)
+	a.mu.RUnlock()
+	if unchanged {
+		return nil
 	}
+	path, err := config.DefaultPath()
+	if err != nil {
+		return fmt.Errorf("configuration applied in memory but could not be persisted: %w", err)
+	}
+	if err := config.SaveAtomic(path, cfg); err != nil {
+		return fmt.Errorf("configuration applied in memory but could not be persisted: %w", err)
+	}
+	a.mu.Lock()
 	a.config = cfg
 	a.mu.Unlock()
-	path, err := config.DefaultPath()
-	if err == nil {
-		_ = config.SaveAtomic(path, cfg)
-	}
+	return nil
 }
 
 func openWindowsFolder(path string) error {

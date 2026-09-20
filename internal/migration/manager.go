@@ -61,15 +61,17 @@ type persistedState struct {
 // as New(primary) + Old(fallback). New writes therefore continue during the
 // copy, and a hit from the old root can be lazily promoted by cache.Manager.
 type Manager struct {
-	mu       sync.RWMutex
-	roots    *cache.RootSet
-	logs     *logging.Ring
-	status   Status
-	cancel   context.CancelFunc
-	done     chan struct{}
-	paused   bool
-	wake     chan struct{}
-	callback func(Status)
+	mu          sync.RWMutex
+	roots       *cache.RootSet
+	logs        *logging.Ring
+	status      Status
+	cancel      context.CancelFunc
+	done        chan struct{}
+	paused      bool
+	wake        chan struct{}
+	callback    func(Status)
+	persistMu   sync.Mutex
+	lastPersist time.Time
 }
 
 func New(roots *cache.RootSet, logs *logging.Ring) *Manager {
@@ -89,9 +91,10 @@ func (m *Manager) Roots() *cache.RootSet {
 	return m.roots
 }
 
-// Start validates and begins an online migration. The file scan is performed
-// before switching roots, so a malformed source or an invalid target cannot
-// leave the service in a half-switched state.
+// Start validates and begins an online migration. The root switch happens
+// before the scan so the old root becomes an immutable source. Callers that
+// have a live cache manager should hold its write barrier while invoking this
+// method, which closes the scan/switch race for in-flight disk writes.
 func (m *Manager) Start(parent context.Context, oldRoot, newRoot string, callback func(Status)) error {
 	return m.StartWithWorker(parent, parent, oldRoot, newRoot, callback)
 }
@@ -135,8 +138,12 @@ func (m *Manager) StartWithWorker(scanContext, workerContext context.Context, ol
 	}
 	m.mu.Unlock()
 
+	// New writes must target the destination before the source scan begins.
+	// If scanning fails, restore the old primary root before returning.
+	m.roots.BeginMigration(newRoot, oldRoot)
 	files, totalBytes, err := scanFiles(scanContext, oldRoot)
 	if err != nil {
+		m.roots.RestoreFallback()
 		return fmt.Errorf("scan old cache root: %w", err)
 	}
 	ctx, cancel := context.WithCancel(workerContext)
@@ -157,13 +164,52 @@ func (m *Manager) StartWithWorker(scanContext, workerContext context.Context, ol
 	done := m.done
 	m.mu.Unlock()
 
-	// From this point every new cache write goes to the destination. Reads
-	// still fall back to the source until FinishMigration is called.
-	m.roots.BeginMigration(newRoot, oldRoot)
+	// Reads still fall back to the source until FinishMigration is called.
 	m.log(logging.CategoryMigration, "started: "+oldRoot+" -> "+newRoot)
-	m.persist()
+	m.persist(true)
 	go m.run(ctx, done, files)
 	return nil
+}
+
+// CompletedRoot reports a migration that finished before the process could
+// persist the new configured root. It is intentionally conservative: only a
+// completed state whose old root matches the configured root and whose new
+// root still exists is accepted.
+func CompletedRoot(configuredRoot string) (string, bool, error) {
+	configuredRoot, err := absoluteClean(configuredRoot)
+	if err != nil {
+		return "", false, err
+	}
+	data, err := os.ReadFile(filepath.Join(configuredRoot, "state", "migration.json"))
+	if errors.Is(err, os.ErrNotExist) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	var saved persistedState
+	if err := json.Unmarshal(data, &saved); err != nil {
+		return "", false, fmt.Errorf("decode completed migration state: %w", err)
+	}
+	if saved.Status.State != StateCompleted {
+		return "", false, nil
+	}
+	oldRoot, err := absoluteClean(saved.Status.OldRoot)
+	if err != nil || !samePath(oldRoot, configuredRoot) {
+		return "", false, nil
+	}
+	newRoot, err := absoluteClean(saved.Status.NewRoot)
+	if err != nil || samePath(newRoot, configuredRoot) {
+		return "", false, nil
+	}
+	info, err := os.Stat(newRoot)
+	if err != nil {
+		return "", false, nil
+	}
+	if !info.IsDir() {
+		return "", false, nil
+	}
+	return newRoot, true, nil
 }
 
 // Recover resumes a migration whose process was interrupted. The old root is
@@ -239,7 +285,7 @@ func (m *Manager) run(ctx context.Context, done chan struct{}, files []fileRecor
 			m.status.SpeedBytesPerSecond = int64(float64(m.status.CopiedBytes) / elapsed.Seconds())
 		}
 		m.mu.Unlock()
-		m.persist()
+		m.persist(false)
 	}
 
 	if err := verifyMigration(m.statusRoots().new, files); err != nil {
@@ -256,7 +302,7 @@ func (m *Manager) run(ctx context.Context, done chan struct{}, files []fileRecor
 	m.cancel = nil
 	m.callback = nil
 	m.mu.Unlock()
-	m.persist()
+	m.persist(true)
 	m.log(logging.CategoryMigration, "completed")
 	if callback != nil {
 		callback(m.Status())
@@ -272,7 +318,7 @@ func (m *Manager) Pause() error {
 	m.paused = true
 	m.status.State = StatePaused
 	m.mu.Unlock()
-	m.persist()
+	m.persist(true)
 	return nil
 }
 
@@ -287,7 +333,7 @@ func (m *Manager) Resume() error {
 	close(m.wake)
 	m.wake = make(chan struct{})
 	m.mu.Unlock()
-	m.persist()
+	m.persist(true)
 	return nil
 }
 
@@ -345,7 +391,6 @@ func (m *Manager) setCurrent(relative string) {
 	m.mu.Lock()
 	m.status.CurrentFile = relative
 	m.mu.Unlock()
-	m.persist()
 }
 
 type rootsSnapshot struct {
@@ -381,27 +426,40 @@ func (m *Manager) finish(state State, err error) {
 	m.cancel = nil
 	m.callback = nil
 	m.mu.Unlock()
-	m.persist()
+	m.persist(true)
 	m.log(logging.CategoryMigration, fmt.Sprintf("%s: %v", state, err))
 	if callback != nil {
 		callback(m.Status())
 	}
 }
 
-func (m *Manager) persist() {
+func (m *Manager) persist(force bool) {
 	status := m.Status()
 	if status.NewRoot == "" {
 		return
 	}
+	m.persistMu.Lock()
+	defer m.persistMu.Unlock()
+	if !force && !m.lastPersist.IsZero() && time.Since(m.lastPersist) < time.Second {
+		return
+	}
 	payload, err := json.MarshalIndent(persistedState{Status: status, SavedAt: time.Now().UTC()}, "", "  ")
 	if err != nil {
+		m.log(logging.CategoryError, "persist migration state: "+err.Error())
 		return
 	}
 	payload = append(payload, '\n')
-	_ = atomicWrite(filepath.Join(status.NewRoot, "state", "migration.json"), payload, 0o600)
-	if status.OldRoot != "" {
-		_ = atomicWrite(filepath.Join(status.OldRoot, "state", "migration.json"), payload, 0o600)
+	if err := atomicWrite(filepath.Join(status.NewRoot, "state", "migration.json"), payload, 0o600); err != nil {
+		m.log(logging.CategoryError, "persist migration state: "+err.Error())
+		return
 	}
+	if status.OldRoot != "" {
+		if err := atomicWrite(filepath.Join(status.OldRoot, "state", "migration.json"), payload, 0o600); err != nil {
+			m.log(logging.CategoryError, "persist migration state: "+err.Error())
+			return
+		}
+	}
+	m.lastPersist = time.Now()
 }
 
 func (m *Manager) log(category logging.Category, message string) {

@@ -2,6 +2,7 @@ package migration
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -149,5 +150,43 @@ func TestMigrationRejectsInvalidExistingCachePair(t *testing.T) {
 	}
 	if got := manager.Status().State; got != StateError {
 		t.Fatalf("migration state = %q, want error", got)
+	}
+}
+
+func TestCompletedRootReconcilesOnlyMatchingCompletedState(t *testing.T) {
+	parent := t.TempDir()
+	oldRoot := filepath.Join(parent, "old")
+	newRoot := filepath.Join(parent, "new")
+	if err := os.MkdirAll(filepath.Join(oldRoot, "state"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(newRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	payload, err := json.Marshal(persistedState{Status: Status{
+		State:   StateCompleted,
+		OldRoot: oldRoot,
+		NewRoot: newRoot,
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(oldRoot, "state", "migration.json"), payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, ok, err := CompletedRoot(oldRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || got != filepath.Clean(newRoot) {
+		t.Fatalf("CompletedRoot() = %q, %v; want %q, true", got, ok, filepath.Clean(newRoot))
+	}
+
+	if err := os.WriteFile(filepath.Join(oldRoot, "state", "migration.json"), []byte(`{"status":{"state":"running"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := CompletedRoot(oldRoot); err != nil || ok {
+		t.Fatalf("running migration state reconciled: ok=%v err=%v", ok, err)
 	}
 }

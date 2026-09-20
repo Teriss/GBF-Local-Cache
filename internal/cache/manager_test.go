@@ -3,6 +3,7 @@ package cache
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -198,6 +199,173 @@ func TestHeadMissDoesNotDownloadOrCacheBody(t *testing.T) {
 	}
 	if _, _, _, err := manager.disk.Read(hash); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("HEAD created a cache entry: %v", err)
+	}
+}
+
+func TestHeadAndGetMissesDoNotShareSingleFlight(t *testing.T) {
+	headStarted := make(chan struct{})
+	releaseHead := make(chan struct{})
+	var origins atomic.Int64
+	origin := originFunc(func(ctx context.Context, request *http.Request) (*http.Response, error) {
+		origins.Add(1)
+		if request.Method == http.MethodHead {
+			close(headStarted)
+			select {
+			case <-releaseHead:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+			return &http.Response{
+				StatusCode:    http.StatusOK,
+				Header:        http.Header{"Content-Length": []string{"4"}},
+				Body:          http.NoBody,
+				ContentLength: 4,
+			}, nil
+		}
+		return &http.Response{
+			StatusCode:    http.StatusOK,
+			Header:        http.Header{"Content-Type": []string{"application/octet-stream"}},
+			Body:          io.NopCloser(strings.NewReader("body")),
+			ContentLength: 4,
+		}, nil
+	})
+	manager, err := NewManager(ManagerConfig{Root: t.TempDir(), Origin: origin})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, _ := url.Parse("https://static.example.test/shared.bin")
+	headResult := make(chan error, 1)
+	go func() {
+		_, err := manager.Fetch(context.Background(), &http.Request{Method: http.MethodHead, URL: target, Header: make(http.Header)})
+		headResult <- err
+	}()
+	<-headStarted
+
+	getResult := make(chan Result, 1)
+	getErr := make(chan error, 1)
+	go func() {
+		result, err := manager.Fetch(context.Background(), &http.Request{Method: http.MethodGet, URL: target, Header: make(http.Header)})
+		getResult <- result
+		getErr <- err
+	}()
+	select {
+	case err := <-getErr:
+		if err != nil {
+			t.Fatal(err)
+		}
+		result := <-getResult
+		if string(result.Body) != "body" {
+			t.Fatalf("GET body = %q, want body", result.Body)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("GET waited for the in-flight HEAD request")
+	}
+	close(releaseHead)
+	if err := <-headResult; err != nil {
+		t.Fatal(err)
+	}
+	if got := origins.Load(); got != 2 {
+		t.Fatalf("origin requests = %d, want independent HEAD and GET requests", got)
+	}
+}
+
+func TestManagerRevalidatesExplicitlyStaleEntry(t *testing.T) {
+	var origins atomic.Int64
+	origin := originFunc(func(ctx context.Context, request *http.Request) (*http.Response, error) {
+		if origins.Add(1) == 1 {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header: http.Header{
+					"Content-Type":  []string{"application/octet-stream"},
+					"Cache-Control": []string{"max-age=0"},
+					"ETag":          []string{`"asset-v1"`},
+				},
+				Body:          io.NopCloser(strings.NewReader("body")),
+				ContentLength: 4,
+			}, nil
+		}
+		if got := request.Header.Get("If-None-Match"); got != `"asset-v1"` {
+			return nil, fmt.Errorf("If-None-Match = %q, want %q", got, `"asset-v1"`)
+		}
+		return &http.Response{
+			StatusCode: http.StatusNotModified,
+			Header:     http.Header{"Cache-Control": []string{"max-age=60"}, "ETag": []string{`"asset-v1"`}},
+			Body:       http.NoBody,
+		}, nil
+	})
+	manager, err := NewManager(ManagerConfig{Root: t.TempDir(), Origin: origin})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, _ := url.Parse("https://static.example.test/revalidate.bin")
+	request := &http.Request{Method: http.MethodGet, URL: target, Header: make(http.Header)}
+	first, err := manager.Fetch(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(10 * time.Millisecond)
+	second, err := manager.Fetch(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(second.Body) != "body" || second.Entry.ETag != `"asset-v1"` {
+		t.Fatalf("revalidated result = body %q, etag %q", second.Body, second.Entry.ETag)
+	}
+	if !second.Entry.CreatedAt.After(first.Entry.CreatedAt) {
+		t.Fatal("304 response did not refresh cache freshness timestamp")
+	}
+	if got := origins.Load(); got != 2 {
+		t.Fatalf("origin requests = %d, want initial fetch plus revalidation", got)
+	}
+}
+
+func TestIsFreshHonorsExplicitDirectives(t *testing.T) {
+	now := time.Unix(1000, 0)
+	entry := CacheEntry{CreatedAt: now.Add(-2 * time.Second), Headers: http.Header{"Cache-Control": []string{"public, max-age=1"}}}
+	if IsFresh(entry, now) {
+		t.Fatal("max-age entry was reported fresh after expiration")
+	}
+	entry.Headers.Set("Cache-Control", "no-cache")
+	if IsFresh(entry, now) {
+		t.Fatal("no-cache entry was reported fresh")
+	}
+	entry.Headers = http.Header{"Content-Type": []string{"application/octet-stream"}}
+	if !IsFresh(entry, now) {
+		t.Fatal("entry without freshness directives was reported stale")
+	}
+}
+
+func TestRootTransitionDrainsActiveWriters(t *testing.T) {
+	manager, err := NewManager(ManagerConfig{Root: t.TempDir(), Origin: originFunc(func(context.Context, *http.Request) (*http.Response, error) {
+		return nil, errors.New("not used")
+	})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.writeGate.enter(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		release, err := manager.BeginRootTransition(context.Background())
+		if err == nil {
+			release()
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("root transition completed while writer was active: %v", err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	manager.writeGate.leave()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("root transition did not finish after writer drained")
 	}
 }
 

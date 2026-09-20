@@ -79,7 +79,11 @@ func validateResponse(response *http.Response, body []byte) error {
 	if looksLikeHTML(body) {
 		return fmt.Errorf("HTML error page is not a static resource")
 	}
-	if response.Header.Get("Content-Encoding") == "" {
+	// Host admission and GET/HEAD method checks define the cache boundary.
+	// Known static media types receive magic-byte validation; unknown CDN
+	// resource types remain allowed because GBF can serve opaque assets such
+	// as application/octet-stream and future formats.
+	if IsStaticContentType(response.Header.Get("Content-Type")) && response.Header.Get("Content-Encoding") == "" {
 		if err := validateMagic(response.Header.Get("Content-Type"), body); err != nil {
 			return err
 		}
