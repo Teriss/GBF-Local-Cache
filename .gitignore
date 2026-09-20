@@ -1,0 +1,8 @@
+frontend/node_modules/
+frontend/dist/*
+!frontend/dist/.gitkeep
+build/bin/
+*.exe
+*.syso
+*.test
+plan.md
