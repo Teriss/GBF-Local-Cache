@@ -6,6 +6,11 @@
 
 <p align="center">面向 Granblue Fantasy 静态 CDN 的 Windows 本地缓存代理。</p>
 
+<p align="center">
+  <a href="https://github.com/Teriss/GBF-Local-Cache/releases/latest"><img src="https://img.shields.io/github/v/release/Teriss/GBF-Local-Cache?display_name=tag&sort=semver" alt="Latest Release"></a>
+  <a href="https://github.com/Teriss/GBF-Local-Cache/releases/latest">下载最新版本</a>
+</p>
+
 ## 功能
 
 - 精确白名单代理 `prd-game-a-granbluefantasy.akamaized.net`。
@@ -103,3 +108,7 @@ build\bin\gbf-local-cache.exe
 ```
 
 默认监听地址为 `127.0.0.1:8124`，仅接受本机连接。
+
+## 开源协议
+
+本项目采用 [MIT License](LICENSE)。

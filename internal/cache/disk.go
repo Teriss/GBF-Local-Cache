@@ -65,6 +65,8 @@ type DiskStore struct {
 	roots       *RootSet
 	writes      sync.WaitGroup
 	writeSlots  chan struct{}
+	writeLocks  [16]sync.Mutex
+	sizeWork    sync.RWMutex
 	sizeMu      sync.Mutex
 	cachedSize  int64
 	sizeVersion uint64
@@ -131,8 +133,11 @@ func (s *DiskStore) Put(hash string, entry CacheEntry, body []byte) error {
 	if !validHash(hash) {
 		return fmt.Errorf("invalid cache hash %q", hash)
 	}
-	s.sizeMu.Lock()
-	defer s.sizeMu.Unlock()
+	writeLock := &s.writeLocks[hashStripe(hash)]
+	writeLock.Lock()
+	defer writeLock.Unlock()
+	s.sizeWork.RLock()
+	defer s.sizeWork.RUnlock()
 	primary, _ := s.roots.Roots()
 	if primary == "" {
 		return errors.New("cache root is empty")
@@ -140,10 +145,14 @@ func (s *DiskStore) Put(hash string, entry CacheEntry, body []byte) error {
 	version := s.roots.Version()
 	before := cacheFileSize(primary, hash)
 	if err := writeObject(primary, hash, entry, body); err != nil {
+		s.sizeMu.Lock()
 		s.sizeReady = false
+		s.sizeMu.Unlock()
 		return err
 	}
 	after := cacheFileSize(primary, hash)
+	s.sizeMu.Lock()
+	defer s.sizeMu.Unlock()
 	if s.sizeReady && s.sizeVersion == version && s.roots.Version() == version {
 		s.cachedSize += after - before
 	} else {
@@ -174,8 +183,8 @@ func (s *DiskStore) Wait(ctx context.Context) error {
 }
 
 func (s *DiskStore) Clear() error {
-	s.sizeMu.Lock()
-	defer s.sizeMu.Unlock()
+	s.sizeWork.Lock()
+	defer s.sizeWork.Unlock()
 	primary, fallback := s.roots.Roots()
 	for _, root := range []string{primary, fallback} {
 		if root == "" {
@@ -194,6 +203,8 @@ func (s *DiskStore) Clear() error {
 			return err
 		}
 	}
+	s.sizeMu.Lock()
+	defer s.sizeMu.Unlock()
 	s.sizeReady = false
 	return nil
 }
@@ -203,6 +214,8 @@ func (s *DiskStore) Clear() error {
 // invalidate it. This keeps frequent UI snapshots from walking the whole
 // cache tree.
 func (s *DiskStore) DiskSize() int64 {
+	s.sizeWork.Lock()
+	defer s.sizeWork.Unlock()
 	version := s.roots.Version()
 	s.sizeMu.Lock()
 	defer s.sizeMu.Unlock()
@@ -217,6 +230,8 @@ func (s *DiskStore) DiskSize() int64 {
 // RefreshSize performs an explicit full recalculation. It is useful after an
 // external migration worker has copied files outside DiskStore.Put.
 func (s *DiskStore) RefreshSize() {
+	s.sizeWork.Lock()
+	defer s.sizeWork.Unlock()
 	s.sizeMu.Lock()
 	defer s.sizeMu.Unlock()
 	s.cachedSize = s.calculateSize()
@@ -250,6 +265,14 @@ func cacheFileSize(root, hash string) int64 {
 		}
 	}
 	return total
+}
+
+func hashStripe(hash string) int {
+	value := hash[0]
+	if value >= 'a' && value <= 'f' {
+		return int(value-'a') + 10
+	}
+	return int(value-'0') % 16
 }
 
 func (s *DiskStore) Inspect(ctx context.Context) (HealthReport, error) {

@@ -459,6 +459,49 @@ func verifyMigration(root string, files []fileRecord) error {
 		if !info.Mode().IsRegular() {
 			return fmt.Errorf("verify %s: destination is not a regular file", file.Relative)
 		}
+		if strings.HasPrefix(filepath.ToSlash(file.Relative), "metadata/") && strings.HasSuffix(strings.ToLower(file.Relative), ".json") {
+			if err := verifyMetadataPair(root, file.Relative); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func verifyMetadataPair(root, relative string) error {
+	metadataPath := filepath.Join(root, relative)
+	metadataBytes, err := os.ReadFile(metadataPath)
+	if err != nil {
+		return fmt.Errorf("verify %s: read metadata: %w", relative, err)
+	}
+	var entry cache.CacheEntry
+	if err := entry.Unmarshal(metadataBytes); err != nil {
+		return fmt.Errorf("verify %s: decode metadata: %w", relative, err)
+	}
+	if entry.Version != cache.MetadataVersion || entry.ContentLength < 0 {
+		return fmt.Errorf("verify %s: invalid cache metadata", relative)
+	}
+	metadataRoot := filepath.Join(root, "metadata")
+	metadataRelative, err := filepath.Rel(metadataRoot, metadataPath)
+	if err != nil || metadataRelative == "." || strings.HasPrefix(metadataRelative, ".."+string(os.PathSeparator)) {
+		return fmt.Errorf("verify %s: invalid metadata path", relative)
+	}
+	hash := strings.TrimSuffix(metadataRelative, filepath.Ext(metadataRelative))
+	objectPath := filepath.Join(root, "objects", hash)
+	objectInfo, err := os.Stat(objectPath)
+	if err != nil {
+		return fmt.Errorf("verify %s: object is missing: %w", relative, err)
+	}
+	if !objectInfo.Mode().IsRegular() || objectInfo.Size() != entry.ContentLength {
+		return fmt.Errorf("verify %s: metadata/object length mismatch", relative)
+	}
+	if entry.SHA256 != "" {
+		if len(entry.SHA256) != 64 {
+			return fmt.Errorf("verify %s: invalid SHA-256 metadata", relative)
+		}
+		if _, err := hex.DecodeString(entry.SHA256); err != nil {
+			return fmt.Errorf("verify %s: invalid SHA-256 metadata: %w", relative, err)
+		}
 	}
 	return nil
 }

@@ -62,6 +62,8 @@ type Service struct {
 	migration       *migration.Manager
 	stats           *stats.Stats
 	logs            *logging.Ring
+	serviceCtx      context.Context
+	serviceCancel   context.CancelFunc
 	migrationCtx    context.Context
 	migrationCancel context.CancelFunc
 }
@@ -101,28 +103,33 @@ func (s *Service) Start(ctx context.Context) error {
 	if activeMigration == nil || (activeMigration.Status().State != migration.StateRunning && activeMigration.Status().State != migration.StatePaused) {
 		activeMigration = nil
 	}
+	serviceCtx, serviceCancel := context.WithCancel(context.Background())
 	migrationCtx := s.migrationCtx
 	if migrationCtx == nil {
 		migrationCtx = context.Background()
 	}
 	s.mu.Unlock()
+	failStart := func(err error) error {
+		serviceCancel()
+		return s.startFailure(err)
+	}
 
 	if err := os.MkdirAll(cfg.CacheRoot, 0o700); err != nil {
-		return s.startFailure(fmt.Errorf("create cache root: %w", err))
+		return failStart(fmt.Errorf("create cache root: %w", err))
 	}
 	origin, err := network.NewManager(cfg)
 	if err != nil {
-		return s.startFailure(fmt.Errorf("create origin network: %w", err))
+		return failStart(fmt.Errorf("create origin network: %w", err))
 	}
 	certDirectory, err := cert.DefaultDirectory()
 	if err != nil {
 		origin.CloseIdleConnections()
-		return s.startFailure(fmt.Errorf("resolve certificate directory: %w", err))
+		return failStart(fmt.Errorf("resolve certificate directory: %w", err))
 	}
 	ca := cert.New(certDirectory)
 	if err := ca.Ensure(); err != nil {
 		origin.CloseIdleConnections()
-		return s.startFailure(fmt.Errorf("initialize Root CA: %w", err))
+		return failStart(fmt.Errorf("initialize Root CA: %w", err))
 	}
 	managerConfig := cache.ManagerConfig{
 		RAMBytes:       int64(cfg.RAMCacheMB) << 20,
@@ -130,7 +137,7 @@ func (s *Service) Start(ctx context.Context) error {
 		Origin:         origin,
 		Stats:          s.stats,
 		Logs:           s.logs,
-		Context:        ctx,
+		Context:        serviceCtx,
 	}
 	if activeMigration != nil && activeMigration.Roots() != nil {
 		managerConfig.Roots = activeMigration.Roots()
@@ -140,19 +147,19 @@ func (s *Service) Start(ctx context.Context) error {
 	manager, err := cache.NewManager(managerConfig)
 	if err != nil {
 		origin.CloseIdleConnections()
-		return s.startFailure(fmt.Errorf("create cache manager: %w", err))
+		return failStart(fmt.Errorf("create cache manager: %w", err))
 	}
 
 	matcher := host.New(cfg.AllowedHosts, nil)
 	core, err := proxy.NewCachedServer(matcher, origin, manager, ca, s.stats, s.logs)
 	if err != nil {
 		origin.CloseIdleConnections()
-		return s.startFailure(fmt.Errorf("create proxy: %w", err))
+		return failStart(fmt.Errorf("create proxy: %w", err))
 	}
 	listener, err := proxy.StartListener(cfg.ListenAddress, core)
 	if err != nil {
 		origin.CloseIdleConnections()
-		return s.startFailure(fmt.Errorf("start proxy: %w", err))
+		return failStart(fmt.Errorf("start proxy: %w", err))
 	}
 
 	migrator := activeMigration
@@ -166,6 +173,8 @@ func (s *Service) Start(ctx context.Context) error {
 	s.migration = migrator
 	s.listener = listener
 	s.handler = core
+	s.serviceCtx = serviceCtx
+	s.serviceCancel = serviceCancel
 	s.state = StateRunning
 	s.lastError = ""
 	s.mu.Unlock()
@@ -225,7 +234,11 @@ func (s *Service) Stop(ctx context.Context) error {
 	origin := s.origin
 	manager := s.cache
 	migrator := s.migration
+	serviceCancel := s.serviceCancel
 	s.mu.Unlock()
+	if serviceCancel != nil {
+		serviceCancel()
+	}
 
 	var stopErr error
 	if listener != nil {
@@ -250,6 +263,8 @@ func (s *Service) Stop(ctx context.Context) error {
 		s.migrationCancel()
 	}
 	s.migrationCtx, s.migrationCancel = context.WithCancel(context.Background())
+	s.serviceCtx = nil
+	s.serviceCancel = nil
 	s.listener = nil
 	s.handler = nil
 	s.origin = nil

@@ -104,3 +104,50 @@ func TestMigrationWorkerOutlivesScanContext(t *testing.T) {
 		t.Fatalf("migration state = %q, want completed", got)
 	}
 }
+
+func TestMigrationRejectsInvalidExistingCachePair(t *testing.T) {
+	parent := t.TempDir()
+	oldRoot := filepath.Join(parent, "old")
+	newRoot := filepath.Join(parent, "new")
+	hashPath := filepath.Join("aa", "asset")
+	for _, root := range []string{oldRoot, newRoot} {
+		for _, directory := range []string{"objects/aa", "metadata/aa"} {
+			if err := os.MkdirAll(filepath.Join(root, directory), 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := os.WriteFile(filepath.Join(oldRoot, "objects", hashPath), []byte("valid"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	validEntry := cache.CacheEntry{Version: cache.MetadataVersion, ContentLength: 5, StatusCode: 200}
+	validMetadata, err := validEntry.Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(oldRoot, "metadata", hashPath+".json"), validMetadata, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(newRoot, "objects", hashPath), []byte("broken-size"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	invalidEntry := cache.CacheEntry{Version: cache.MetadataVersion, ContentLength: 999, StatusCode: 200}
+	invalidMetadata, err := invalidEntry.Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(newRoot, "metadata", hashPath+".json"), invalidMetadata, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	manager := New(cache.NewRootSet(oldRoot), logging.NewRing(20))
+	if err := manager.Start(context.Background(), oldRoot, newRoot, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Wait(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := manager.Status().State; got != StateError {
+		t.Fatalf("migration state = %q, want error", got)
+	}
+}

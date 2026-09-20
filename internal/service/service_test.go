@@ -42,6 +42,40 @@ func TestServiceLifecycle(t *testing.T) {
 	}
 }
 
+func TestServiceOwnsCacheLifecycleContext(t *testing.T) {
+	cfg := config.Default()
+	cfg.CacheRoot = t.TempDir()
+	cfg.ListenAddress = freeLoopbackAddress(t)
+	svc, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	callerContext, cancelCaller := context.WithCancel(context.Background())
+	if err := svc.Start(callerContext); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	svc.mu.RLock()
+	serviceContext := svc.serviceCtx
+	svc.mu.RUnlock()
+	if serviceContext == nil {
+		t.Fatal("service lifecycle context was not initialized")
+	}
+	cancelCaller()
+	select {
+	case <-serviceContext.Done():
+		t.Fatal("caller context canceled the service lifecycle context")
+	default:
+	}
+	if err := svc.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+	select {
+	case <-serviceContext.Done():
+	case <-time.After(time.Second):
+		t.Fatal("service lifecycle context was not canceled on Stop")
+	}
+}
+
 func TestChangeListenPortWhileRunning(t *testing.T) {
 	first := freeLoopbackAddress(t)
 	second := freeLoopbackAddress(t)
