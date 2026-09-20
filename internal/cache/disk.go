@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"gbf-local-cache/internal/platform"
 )
 
 type RootSet struct {
@@ -435,13 +437,7 @@ func writeObject(root, hash string, entry CacheEntry, body []byte) error {
 }
 
 func replaceFile(tempName, destination string) error {
-	if err := os.Rename(tempName, destination); err == nil {
-		return nil
-	}
-	if err := os.Remove(destination); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	return os.Rename(tempName, destination)
+	return platform.ReplaceFile(tempName, destination)
 }
 
 func objectPath(root, hash string) string {

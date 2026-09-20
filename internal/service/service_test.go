@@ -131,7 +131,7 @@ func portFromAddress(t *testing.T, address string) int {
 	return port
 }
 
-func TestChangeCacheRootWhileStoppedRenamesSameVolume(t *testing.T) {
+func TestChangeCacheRootWhileStoppedMigratesManagedDataOnly(t *testing.T) {
 	base := t.TempDir()
 	oldRoot := filepath.Join(base, "old-cache")
 	newRoot := filepath.Join(base, "new-cache")
@@ -145,6 +145,10 @@ func TestChangeCacheRootWhileStoppedRenamesSameVolume(t *testing.T) {
 	if err := os.WriteFile(marker, []byte("cached"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	unmanaged := filepath.Join(oldRoot, "unmanaged-user-file.txt")
+	if err := os.WriteFile(unmanaged, []byte("must stay behind"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
 	cfg := config.Default()
 	cfg.CacheRoot = oldRoot
@@ -155,11 +159,22 @@ func TestChangeCacheRootWhileStoppedRenamesSameVolume(t *testing.T) {
 	if err := svc.ChangeCacheRoot(context.Background(), newRoot); err != nil {
 		t.Fatalf("ChangeCacheRoot() error = %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(newRoot, "objects", "marker.bin")); err != nil {
-		t.Fatalf("moved cache marker: %v", err)
+	svc.mu.RLock()
+	migrator := svc.migration
+	svc.mu.RUnlock()
+	if migrator == nil {
+		t.Fatal("stopped migration did not create a migration manager")
 	}
-	if _, err := os.Stat(oldRoot); !os.IsNotExist(err) {
-		t.Fatalf("old cache root still exists, stat error = %v", err)
+	waitContext, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := migrator.Wait(waitContext); err != nil {
+		t.Fatalf("migration did not finish: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(newRoot, "objects", "marker.bin")); err != nil {
+		t.Fatalf("migrated cache marker: %v", err)
+	}
+	if _, err := os.Stat(unmanaged); err != nil {
+		t.Fatalf("unmanaged file was not left in the old directory: %v", err)
 	}
 	if got := svc.Snapshot().CacheRoot; got != newRoot {
 		t.Fatalf("snapshot cache root = %q, want %q", got, newRoot)

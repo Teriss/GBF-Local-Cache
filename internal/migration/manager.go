@@ -16,6 +16,7 @@ import (
 
 	"gbf-local-cache/internal/cache"
 	"gbf-local-cache/internal/logging"
+	"gbf-local-cache/internal/platform"
 )
 
 // State describes the lifecycle of an online cache migration.
@@ -127,7 +128,10 @@ func (m *Manager) StartWithWorker(scanContext, workerContext context.Context, ol
 	if m.roots == nil {
 		return errors.New("migration root set is not initialized")
 	}
-	if err := ensureWritableDirectory(newRoot); err != nil {
+	if err := cache.EnsureRoot(oldRoot); err != nil {
+		return fmt.Errorf("old cache root is not valid: %w", err)
+	}
+	if err := cache.EnsureRoot(newRoot); err != nil {
 		return fmt.Errorf("new cache root is not writable: %w", err)
 	}
 
@@ -471,40 +475,53 @@ func (m *Manager) log(category logging.Category, message string) {
 func scanFiles(ctx context.Context, root string) ([]fileRecord, int64, error) {
 	var files []fileRecord
 	var total int64
-	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
+	for _, directory := range cache.ManagedDataDirectories() {
+		base := filepath.Join(root, directory)
+		info, err := os.Lstat(base)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
 		}
 		if err != nil {
-			return err
+			return nil, 0, err
 		}
-		relative, err := filepath.Rel(root, path)
-		if err != nil {
-			return err
+		if !info.IsDir() {
+			return nil, 0, fmt.Errorf("managed cache path is not a directory: %s", directory)
 		}
-		if relative == "." {
-			return nil
-		}
-		if entry.IsDir() {
-			if strings.EqualFold(filepath.ToSlash(relative), "state") {
-				return filepath.SkipDir
+		err = filepath.WalkDir(base, func(path string, entry os.DirEntry, err error) error {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
 			}
+			if err != nil {
+				return err
+			}
+			relative, err := filepath.Rel(root, path)
+			if err != nil {
+				return err
+			}
+			if entry.IsDir() {
+				return nil
+			}
+			if entry.Type()&os.ModeSymlink != 0 {
+				return fmt.Errorf("symlink is not allowed in managed cache data: %s", relative)
+			}
+			fileInfo, err := entry.Info()
+			if err != nil {
+				return err
+			}
+			if !fileInfo.Mode().IsRegular() {
+				return fmt.Errorf("managed cache entry is not a regular file: %s", relative)
+			}
+			files = append(files, fileRecord{Relative: relative, Size: fileInfo.Size()})
+			total += fileInfo.Size()
 			return nil
-		}
-		if entry.Type()&os.ModeSymlink != 0 {
-			return fmt.Errorf("symlink is not allowed in cache root: %s", relative)
-		}
-		info, err := entry.Info()
+		})
 		if err != nil {
-			return err
+			return nil, 0, err
 		}
-		files = append(files, fileRecord{Relative: relative, Size: info.Size()})
-		total += info.Size()
-		return nil
-	})
-	return files, total, err
+	}
+	return files, total, nil
 }
 
 func verifyMigration(root string, files []fileRecord) error {
@@ -668,29 +685,7 @@ func hashFile(path string) (string, error) {
 }
 
 func replaceFile(source, destination string) error {
-	if err := os.Rename(source, destination); err == nil {
-		return nil
-	}
-	if err := os.Remove(destination); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	return os.Rename(source, destination)
-}
-
-func ensureWritableDirectory(path string) error {
-	if err := os.MkdirAll(path, 0o700); err != nil {
-		return err
-	}
-	test, err := os.CreateTemp(path, ".write-test-*.tmp")
-	if err != nil {
-		return err
-	}
-	name := test.Name()
-	if err := test.Close(); err != nil {
-		_ = os.Remove(name)
-		return err
-	}
-	return os.Remove(name)
+	return platform.ReplaceFile(source, destination)
 }
 
 func absoluteClean(path string) (string, error) {

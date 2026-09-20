@@ -104,8 +104,14 @@ build\bin\gbf-local-cache.exe
 ```text
 %LOCALAPPDATA%\GBFLocalCache\config.json
 %LOCALAPPDATA%\GBFLocalCache\cache\
+├── .gbf-local-cache       # 缓存根目录标记
+├── objects\               # 缓存对象
+├── metadata\              # 缓存元数据
+└── state\                 # 迁移状态
 %LOCALAPPDATA%\GBFLocalCache\certs\
 ```
+
+迁移和磁盘统计只处理 `objects`、`metadata`，不会移动或计入缓存根目录中的其他文件。
 
 默认监听地址为 `127.0.0.1:8124`，仅接受本机连接。
 

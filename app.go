@@ -26,6 +26,7 @@ import (
 // to backend goroutines.
 type App struct {
 	mu            sync.RWMutex
+	configWriteMu sync.Mutex
 	ctx           context.Context
 	config        config.Config
 	service       *service.Service
@@ -487,6 +488,8 @@ func (a *App) MigrationStatus() migration.Status {
 }
 
 func (a *App) syncPersistedConfig(cfg config.Config) error {
+	a.configWriteMu.Lock()
+	defer a.configWriteMu.Unlock()
 	a.mu.RLock()
 	unchanged := reflect.DeepEqual(a.config, cfg)
 	a.mu.RUnlock()

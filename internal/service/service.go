@@ -118,8 +118,23 @@ func (s *Service) Start(ctx context.Context) error {
 		return s.startFailure(err)
 	}
 
-	if err := os.MkdirAll(cfg.CacheRoot, 0o700); err != nil {
-		return failStart(fmt.Errorf("create cache root: %w", err))
+	if err := cache.EnsureRoot(cfg.CacheRoot); err != nil {
+		return failStart(fmt.Errorf("initialize cache root: %w", err))
+	}
+	resumeCallback := func(status migration.Status) {
+		s.applyMigrationConfig(status)
+	}
+	migrator := activeMigration
+	if migrator == nil {
+		migrator = migration.New(cache.NewRootSet(cfg.CacheRoot), s.logs)
+		// Recovery must finish its synchronous validation and source scan before
+		// opening the proxy listener. Otherwise requests can arrive while the
+		// RootSet still points at an incomplete migration destination.
+		if recovered, recoverErr := migrator.RecoverWithWorker(serviceCtx, migrationCtx, cfg.CacheRoot, resumeCallback); recoverErr != nil {
+			s.logs.Add(logging.Entry{Category: logging.CategoryMigration, Message: "migration recovery skipped: " + recoverErr.Error()})
+		} else if recovered {
+			s.logs.Add(logging.Entry{Category: logging.CategoryMigration, Message: "migration recovery started"})
+		}
 	}
 	origin, err := network.NewManager(cfg)
 	if err != nil {
@@ -143,11 +158,7 @@ func (s *Service) Start(ctx context.Context) error {
 		Logs:           s.logs,
 		Context:        serviceCtx,
 	}
-	if activeMigration != nil && activeMigration.Roots() != nil {
-		managerConfig.Roots = activeMigration.Roots()
-	} else {
-		managerConfig.Root = cfg.CacheRoot
-	}
+	managerConfig.Roots = migrator.Roots()
 	manager, err := cache.NewManager(managerConfig)
 	if err != nil {
 		origin.CloseIdleConnections()
@@ -166,10 +177,6 @@ func (s *Service) Start(ctx context.Context) error {
 		return failStart(fmt.Errorf("start proxy: %w", err))
 	}
 
-	migrator := activeMigration
-	if migrator == nil {
-		migrator = migration.New(manager.Roots(), s.logs)
-	}
 	s.mu.Lock()
 	s.origin = origin
 	s.cache = manager
@@ -183,17 +190,6 @@ func (s *Service) Start(ctx context.Context) error {
 	s.lastError = ""
 	s.mu.Unlock()
 	s.logs.Add(logging.Entry{Category: logging.CategoryNetwork, Message: "service started on " + listener.Address()})
-	resumeCallback := func(status migration.Status) {
-		s.applyMigrationConfig(status)
-	}
-	if activeMigration != nil {
-		return nil
-	}
-	if recovered, recoverErr := migrator.RecoverWithWorker(ctx, migrationCtx, cfg.CacheRoot, resumeCallback); recoverErr != nil {
-		s.logs.Add(logging.Entry{Category: logging.CategoryMigration, Message: "migration recovery skipped: " + recoverErr.Error()})
-	} else if recovered {
-		s.logs.Add(logging.Entry{Category: logging.CategoryMigration, Message: "migration recovery started"})
-	}
 	return nil
 }
 
@@ -229,6 +225,7 @@ func (s *Service) Stop(ctx context.Context) error {
 	}
 	s.state = StateStopping
 	listener := s.listener
+	handler := s.handler
 	origin := s.origin
 	manager := s.cache
 	migrator := s.migration
@@ -241,6 +238,9 @@ func (s *Service) Stop(ctx context.Context) error {
 	var stopErr error
 	if listener != nil {
 		stopErr = listener.Shutdown(ctx)
+	}
+	if handler != nil {
+		handler.CloseHijackedConnections()
 	}
 	if migrator != nil {
 		if err := migrator.Close(ctx); stopErr == nil && err != nil {
@@ -446,6 +446,7 @@ func (s *Service) ChangeListenPort(ctx context.Context, port int) error {
 	if err := listener.Shutdown(ctx); err != nil {
 		return fmt.Errorf("stop proxy listener: %w", err)
 	}
+	handler.CloseHijackedConnections()
 	newListener, err := proxy.StartListener(newAddress, handler)
 	if err != nil {
 		restored, restoreErr := proxy.StartListener(oldAddress, handler)
@@ -575,8 +576,8 @@ func (s *Service) ChangeCacheRoot(ctx context.Context, newRoot string) error {
 			return errors.New("cache migration is already running")
 		}
 	}
-	if err := os.MkdirAll(oldRoot, 0o700); err != nil {
-		return fmt.Errorf("create current cache root: %w", err)
+	if err := cache.EnsureRoot(oldRoot); err != nil {
+		return fmt.Errorf("initialize current cache root: %w", err)
 	}
 	var releaseWrites func()
 	if manager != nil {
@@ -589,19 +590,6 @@ func (s *Service) ChangeCacheRoot(ctx context.Context, newRoot string) error {
 	}
 	if err := os.MkdirAll(filepath.Dir(newRoot), 0o700); err != nil {
 		return err
-	}
-	if _, err := os.Stat(newRoot); errors.Is(err, os.ErrNotExist) && filepath.VolumeName(oldRoot) == filepath.VolumeName(newRoot) {
-		if err := os.Rename(oldRoot, newRoot); err == nil {
-			roots := cache.NewRootSet(oldRoot)
-			if manager != nil {
-				roots = manager.Roots()
-			}
-			roots.BeginMigration(newRoot, "")
-			roots.FinishMigration()
-			s.setCacheRoot(newRoot)
-			s.logs.Add(logging.Entry{Category: logging.CategoryMigration, Message: "cache root renamed to " + newRoot})
-			return nil
-		}
 	}
 	if migrator == nil {
 		roots := cache.NewRootSet(oldRoot)

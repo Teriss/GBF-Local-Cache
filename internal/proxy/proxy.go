@@ -72,12 +72,14 @@ func (c *HTTPOriginClient) CloseIdleConnections() {
 }
 
 type Server struct {
-	whitelist host.HostMatcher
-	origin    OriginClient
-	cache     *cache.Manager
-	ca        *cert.Manager
-	stats     *stats.Stats
-	logs      *logging.Ring
+	whitelist       host.HostMatcher
+	origin          OriginClient
+	cache           *cache.Manager
+	ca              *cert.Manager
+	stats           *stats.Stats
+	logs            *logging.Ring
+	tunnelsMu       sync.Mutex
+	hijackedTunnels map[net.Conn]struct{}
 }
 
 // NewServer keeps the direct, uncached constructor available for focused
@@ -105,7 +107,46 @@ func newServer(matcher host.HostMatcher, origin OriginClient, manager *cache.Man
 	if logs == nil {
 		logs = logging.NewRing(5000)
 	}
-	return &Server{whitelist: matcher, origin: origin, cache: manager, ca: caManager, stats: counters, logs: logs}, nil
+	return &Server{
+		whitelist:       matcher,
+		origin:          origin,
+		cache:           manager,
+		ca:              caManager,
+		stats:           counters,
+		logs:            logs,
+		hijackedTunnels: make(map[net.Conn]struct{}),
+	}, nil
+}
+
+func (s *Server) trackHijackedConnection(connection net.Conn) func() {
+	s.tunnelsMu.Lock()
+	if s.hijackedTunnels == nil {
+		s.hijackedTunnels = make(map[net.Conn]struct{})
+	}
+	s.hijackedTunnels[connection] = struct{}{}
+	s.tunnelsMu.Unlock()
+	return func() {
+		s.tunnelsMu.Lock()
+		delete(s.hijackedTunnels, connection)
+		s.tunnelsMu.Unlock()
+	}
+}
+
+// CloseHijackedConnections closes TLS MITM connections that are not owned by
+// net/http's Server.Shutdown because they were removed from the HTTP server by
+// Hijack. This lets service stop and port changes terminate existing browser
+// sessions instead of leaving them alive after the listener is gone.
+func (s *Server) CloseHijackedConnections() {
+	s.tunnelsMu.Lock()
+	connections := make([]net.Conn, 0, len(s.hijackedTunnels))
+	for connection := range s.hijackedTunnels {
+		connections = append(connections, connection)
+	}
+	s.hijackedTunnels = make(map[net.Conn]struct{})
+	s.tunnelsMu.Unlock()
+	for _, connection := range connections {
+		_ = connection.Close()
+	}
 }
 
 func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
@@ -246,6 +287,8 @@ func (s *Server) serveMITM(writer http.ResponseWriter, request *http.Request, ho
 	if err != nil {
 		return err
 	}
+	unregister := s.trackHijackedConnection(connection)
+	defer unregister()
 	if _, err := buffered.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
 		_ = connection.Close()
 		return err

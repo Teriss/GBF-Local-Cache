@@ -7,6 +7,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -361,6 +362,24 @@ func TestWhitelistedConnectUsesTLSMITMAndNeverTunnelsUnknownHost(t *testing.T) {
 	if originRequests.Load() != 1 {
 		t.Fatalf("origin requests = %d", originRequests.Load())
 	}
+}
+
+func TestCloseHijackedConnectionsClosesTrackedMITMConnections(t *testing.T) {
+	server, err := NewServer(host.New([]string{"static.example.test"}, nil), roundTripFunc(func(context.Context, *http.Request) (*http.Response, error) {
+		return nil, fmt.Errorf("not used")
+	}), &stats.Stats{}, logging.NewRing(10))
+	if err != nil {
+		t.Fatal(err)
+	}
+	left, right := net.Pipe()
+	defer left.Close()
+	unregister := server.trackHijackedConnection(right)
+	server.CloseHijackedConnections()
+	_ = left.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := left.Read(make([]byte, 1)); err == nil {
+		t.Fatal("tracked hijacked connection remained open")
+	}
+	unregister()
 }
 
 func certificateManagerDirectory(manager *cert.Manager) string {

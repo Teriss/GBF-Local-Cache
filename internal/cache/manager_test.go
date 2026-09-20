@@ -335,6 +335,122 @@ func TestIsFreshHonorsExplicitDirectives(t *testing.T) {
 	}
 }
 
+func TestFreshnessDirectivesAreOrderIndependent(t *testing.T) {
+	now := time.Unix(1000, 0)
+	entry := CacheEntry{CreatedAt: now, Headers: make(http.Header)}
+	for _, value := range []string{"max-age=3600, no-cache", "no-cache, max-age=3600"} {
+		entry.Headers.Set("Cache-Control", value)
+		if IsFresh(entry, now) {
+			t.Fatalf("directive order %q was reported fresh", value)
+		}
+	}
+	entry.Headers.Set("Cache-Control", "max-age=3600, must-revalidate")
+	if !IsFresh(entry, now.Add(time.Second)) {
+		t.Fatal("must-revalidate incorrectly made a fresh entry stale")
+	}
+	if IsFresh(entry, now.Add(3601*time.Second)) {
+		t.Fatal("must-revalidate entry remained fresh after max-age")
+	}
+	entry.Headers.Set("Cache-Control", "no-store")
+	if IsFresh(entry, now) || CanServeStale(entry) {
+		t.Fatal("no-store entry was considered fresh or eligible for stale fallback")
+	}
+}
+
+func TestFreshnessUsesDateAndAge(t *testing.T) {
+	now := time.Unix(1000, 0)
+	entry := CacheEntry{
+		CreatedAt: now,
+		Headers: http.Header{
+			"Cache-Control": []string{"max-age=8"},
+			"Date":          []string{now.Add(-10 * time.Second).UTC().Format(http.TimeFormat)},
+			"Age":           []string{"5"},
+		},
+	}
+	if IsFresh(entry, now.Add(5*time.Second)) {
+		t.Fatal("Date/Age current age was not included in freshness calculation")
+	}
+}
+
+func TestNoStoreResponseIsNotCached(t *testing.T) {
+	var origins atomic.Int64
+	origin := originFunc(func(context.Context, *http.Request) (*http.Response, error) {
+		origins.Add(1)
+		return &http.Response{
+			StatusCode:    http.StatusOK,
+			Header:        http.Header{"Content-Type": []string{"application/octet-stream"}, "Cache-Control": []string{"no-store"}},
+			Body:          io.NopCloser(strings.NewReader("private")),
+			ContentLength: 7,
+		}, nil
+	})
+	manager, err := NewManager(ManagerConfig{Root: t.TempDir(), Origin: origin})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, _ := url.Parse("https://static.example.test/private.bin")
+	request := &http.Request{Method: http.MethodGet, URL: target, Header: make(http.Header)}
+	if result, err := manager.Fetch(context.Background(), request); err != nil || result.Cacheable {
+		t.Fatalf("no-store result = %#v, err = %v", result, err)
+	}
+	if err := manager.Wait(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	_, hash, err := CanonicalKey(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok := manager.ram.Get(hash); ok {
+		t.Fatal("no-store response was retained in RAM")
+	}
+	if _, _, _, err := manager.disk.Read(hash); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("no-store response was written to disk: %v", err)
+	}
+	if _, err := manager.Fetch(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if got := origins.Load(); got != 2 {
+		t.Fatalf("origin requests = %d, want 2 for two no-store requests", got)
+	}
+}
+
+func TestRequestNoCacheForcesRevalidation(t *testing.T) {
+	var origins atomic.Int64
+	origin := originFunc(func(_ context.Context, request *http.Request) (*http.Response, error) {
+		if origins.Add(1) == 1 {
+			return &http.Response{
+				StatusCode:    http.StatusOK,
+				Header:        http.Header{"Content-Type": []string{"application/octet-stream"}, "Cache-Control": []string{"max-age=3600"}, "ETag": []string{`"v1"`}},
+				Body:          io.NopCloser(strings.NewReader("body")),
+				ContentLength: 4,
+			}, nil
+		}
+		if got := request.Header.Get("If-None-Match"); got != `"v1"` {
+			return nil, fmt.Errorf("If-None-Match = %q, want %q", got, `"v1"`)
+		}
+		return &http.Response{
+			StatusCode: http.StatusNotModified,
+			Header:     http.Header{"Cache-Control": []string{"max-age=3600"}, "ETag": []string{`"v1"`}},
+			Body:       http.NoBody,
+		}, nil
+	})
+	manager, err := NewManager(ManagerConfig{Root: t.TempDir(), Origin: origin})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, _ := url.Parse("https://static.example.test/forced.bin")
+	firstRequest := &http.Request{Method: http.MethodGet, URL: target, Header: make(http.Header)}
+	if _, err := manager.Fetch(context.Background(), firstRequest); err != nil {
+		t.Fatal(err)
+	}
+	secondRequest := &http.Request{Method: http.MethodGet, URL: target, Header: http.Header{"Cache-Control": []string{"no-cache"}}}
+	if result, err := manager.Fetch(context.Background(), secondRequest); err != nil || string(result.Body) != "body" {
+		t.Fatalf("forced revalidation result = %#v, err = %v", result, err)
+	}
+	if got := origins.Load(); got != 2 {
+		t.Fatalf("origin requests = %d, want 2", got)
+	}
+}
+
 func TestRootTransitionDrainsActiveWriters(t *testing.T) {
 	manager, err := NewManager(ManagerConfig{Root: t.TempDir(), Origin: originFunc(func(context.Context, *http.Request) (*http.Response, error) {
 		return nil, errors.New("not used")
@@ -366,6 +482,27 @@ func TestRootTransitionDrainsActiveWriters(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("root transition did not finish after writer drained")
+	}
+}
+
+func TestStoreQueuesBehindRootTransitionWithoutBlocking(t *testing.T) {
+	manager, err := NewManager(ManagerConfig{Root: t.TempDir(), Origin: originFunc(func(context.Context, *http.Request) (*http.Response, error) {
+		return nil, errors.New("not used")
+	})})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.writeGate.begin(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	manager.store(strings.Repeat("a", 64), CacheEntry{Version: MetadataVersion, StatusCode: http.StatusOK}, []byte("body"), nil)
+	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+		t.Fatalf("store blocked behind root transition for %v", elapsed)
+	}
+	manager.writeGate.end()
+	if err := manager.Wait(context.Background()); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -415,6 +552,9 @@ func TestWalkSizeExcludesMigrationState(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(root, "state", "migration.json"), make([]byte, 4096), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "unmanaged.txt"), make([]byte, 4096), 0o600); err != nil {
 		t.Fatal(err)
 	}
 

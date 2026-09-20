@@ -7,8 +7,8 @@ import (
 	"io"
 	"io/fs"
 	"net/http"
+	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -60,7 +60,7 @@ type Manager struct {
 	stats         *stats.Stats
 	logs          *logging.Ring
 	flight        singleflight.Group
-	writes        sync.WaitGroup
+	writes        *pendingWrites
 	lifecycle     context.Context
 	writeSlots    chan struct{}
 	writeGate     *writeGate
@@ -74,6 +74,58 @@ type writeGate struct {
 	active  int
 	blocked bool
 	changed chan struct{}
+}
+
+// pendingWrites tracks disk writes that are either waiting for the root
+// transition gate or already writing. A condition channel is used instead of
+// sync.WaitGroup so a request can enqueue work while a waiter is already
+// draining the queue without racing Add and Wait.
+type pendingWrites struct {
+	mu      sync.Mutex
+	count   int
+	changed chan struct{}
+}
+
+func newPendingWrites() *pendingWrites {
+	return &pendingWrites{changed: make(chan struct{})}
+}
+
+func (p *pendingWrites) Add() {
+	p.mu.Lock()
+	p.count++
+	p.mu.Unlock()
+}
+
+func (p *pendingWrites) Done() {
+	p.mu.Lock()
+	if p.count > 0 {
+		p.count--
+		if p.count == 0 {
+			close(p.changed)
+			p.changed = make(chan struct{})
+		}
+	}
+	p.mu.Unlock()
+}
+
+func (p *pendingWrites) Wait(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for {
+		p.mu.Lock()
+		if p.count == 0 {
+			p.mu.Unlock()
+			return nil
+		}
+		changed := p.changed
+		p.mu.Unlock()
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
 }
 
 func newWriteGate() *writeGate {
@@ -178,6 +230,15 @@ func NewManager(cfg ManagerConfig) (*Manager, error) {
 	if cfg.Context == nil {
 		cfg.Context = context.Background()
 	}
+	primary, fallback := cfg.Roots.Roots()
+	for _, root := range []string{primary, fallback} {
+		if root == "" {
+			continue
+		}
+		if err := EnsureRoot(root); err != nil {
+			return nil, fmt.Errorf("initialize cache root %s: %w", root, err)
+		}
+	}
 	return &Manager{
 		disk:          NewDiskStore(cfg.Roots),
 		ram:           NewRAMCache(cfg.RAMBytes, cfg.RAMObjectBytes),
@@ -188,6 +249,7 @@ func NewManager(cfg ManagerConfig) (*Manager, error) {
 		lifecycle:     cfg.Context,
 		writeSlots:    make(chan struct{}, 4),
 		writeGate:     newWriteGate(),
+		writes:        newPendingWrites(),
 	}, nil
 }
 
@@ -224,7 +286,7 @@ func (m *Manager) Fetch(ctx context.Context, request *http.Request) (Result, err
 		m.stats.AddBytesSaved(served)
 		m.log(logging.CategoryHit, request, "RAM", len(body))
 		cached := Result{Key: hash, Canonical: canonical, Entry: entry, Body: body, Source: SourceRAM, Cacheable: true}
-		if request.Method == http.MethodGet && !IsFresh(entry, time.Now()) {
+		if request.Method == http.MethodGet && (RequestForcesRevalidate(request) || !IsFresh(entry, time.Now())) {
 			return m.revalidateCached(ctx, request, hash, canonical, cached)
 		}
 		return cached, nil
@@ -241,7 +303,7 @@ func (m *Manager) Fetch(ctx context.Context, request *http.Request) (Result, err
 		}
 		m.log(logging.CategoryHit, request, "Disk", len(body))
 		cached := Result{Key: hash, Canonical: canonical, Entry: entry, Body: body, Source: SourceDisk, Cacheable: true}
-		if request.Method == http.MethodGet && !IsFresh(entry, time.Now()) {
+		if request.Method == http.MethodGet && (RequestForcesRevalidate(request) || !IsFresh(entry, time.Now())) {
 			return m.revalidateCached(ctx, request, hash, canonical, cached)
 		}
 		return cached, nil
@@ -304,7 +366,7 @@ func (m *Manager) revalidateCached(ctx context.Context, request *http.Request, h
 		return Result{}, ctx.Err()
 	}
 	if resultValue.Err != nil {
-		if m.lifecycle.Err() == nil {
+		if m.lifecycle.Err() == nil && CanServeStale(cached.Entry) && !RequestForcesRevalidate(request) {
 			m.log(logging.CategoryError, request, "revalidation failed; serving stale cache: "+resultValue.Err.Error(), len(cached.Body))
 			return cached, nil
 		}
@@ -342,6 +404,10 @@ func (m *Manager) fetchRevalidated(ctx context.Context, request *http.Request, h
 		}
 		entry.ETag = entry.Headers.Get("ETag")
 		entry.LastModified = entry.Headers.Get("Last-Modified")
+		if !CanStoreResponse(response.Header) || RequestDisallowsStore(request) {
+			m.log(logging.CategoryHit, request, "revalidated 304 (not stored)", len(cached.Body))
+			return Result{Key: hash, Canonical: canonical, Entry: cached.Entry, Body: cached.Body, Source: cached.Source, Cacheable: false}, nil
+		}
 		entry.CreatedAt = time.Now()
 		entry.LastAccessed = entry.CreatedAt
 		m.store(hash, entry, cached.Body, request)
@@ -416,6 +482,10 @@ func (m *Manager) consumeOriginResponse(request *http.Request, hash, canonical s
 	}
 	entry.Headers.Set("Content-Length", fmt.Sprintf("%d", len(body)))
 	entry.ContentLength = int64(len(body))
+	if !CanStoreResponse(response.Header) || RequestDisallowsStore(request) {
+		m.log(logging.CategoryMiss, request, "origin (not stored)", len(body))
+		return Result{Key: hash, Canonical: canonical, Entry: entry, Body: body, Source: SourceOrigin, Cacheable: false}, nil
+	}
 	m.store(hash, entry, body, request)
 	m.log(logging.CategoryMiss, request, "origin", len(body))
 	return Result{Key: hash, Canonical: canonical, Entry: entry, Body: body, Source: SourceOrigin, Cacheable: true}, nil
@@ -423,12 +493,12 @@ func (m *Manager) consumeOriginResponse(request *http.Request, hash, canonical s
 
 func (m *Manager) store(hash string, entry CacheEntry, body []byte, request *http.Request) {
 	m.ram.Put(hash, entry, body)
-	if err := m.writeGate.enter(m.lifecycle); err != nil {
-		return
-	}
-	m.writes.Add(1)
+	m.writes.Add()
 	go func() {
 		defer m.writes.Done()
+		if err := m.writeGate.enter(m.lifecycle); err != nil {
+			return
+		}
 		defer m.writeGate.leave()
 		select {
 		case m.writeSlots <- struct{}{}:
@@ -497,12 +567,15 @@ func (m *Manager) Wait(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer release()
 	if err := m.disk.Wait(ctx); err != nil {
+		release()
 		return err
 	}
-	m.writes.Wait()
-	return nil
+	release()
+	// Queued stores are allowed to enter after the barrier is released. They
+	// target the current RootSet, so wait for them before reporting shutdown
+	// complete without holding the gate and deadlocking the queue.
+	return m.writes.Wait(ctx)
 }
 
 func (m *Manager) log(category logging.Category, request *http.Request, message string, bytes int) {
@@ -561,65 +634,44 @@ func IsStaticContentType(value string) bool {
 		strings.Contains(mediaType, "json")
 }
 
-// IsFresh applies explicit HTTP freshness directives when a CDN provides
-// them. Resources without a freshness directive remain fresh indefinitely;
-// this is intentional for GBF's versioned static assets and avoids adding a
-// surprising network request to every normal cache hit.
-func IsFresh(entry CacheEntry, now time.Time) bool {
-	cacheControl := strings.ToLower(entry.Headers.Get("Cache-Control"))
-	for _, directive := range strings.Split(cacheControl, ",") {
-		parts := strings.SplitN(strings.TrimSpace(directive), "=", 2)
-		name := strings.Trim(strings.TrimSpace(parts[0]), `"`)
-		switch name {
-		case "no-store", "no-cache", "must-revalidate", "proxy-revalidate":
-			return false
-		case "max-age", "s-maxage":
-			if len(parts) != 2 {
-				return false
-			}
-			seconds, err := strconv.ParseInt(strings.Trim(strings.TrimSpace(parts[1]), `"`), 10, 64)
-			if err != nil || seconds < 0 || entry.CreatedAt.IsZero() {
-				return false
-			}
-			return now.Before(entry.CreatedAt.Add(time.Duration(seconds) * time.Second))
-		}
-	}
-	if expires := entry.Headers.Get("Expires"); expires != "" {
-		expiresAt, err := http.ParseTime(expires)
-		if err == nil {
-			return now.Before(expiresAt)
-		}
-	}
-	return true
-}
-
 func (m *Manager) DiskSize() int64 {
 	return m.disk.DiskSize()
 }
 
 func walkSize(root string, total *int64) error {
-	return filepath.WalkDir(root, func(path string, entryDir fs.DirEntry, err error) error {
+	for _, directory := range ManagedDataDirectories() {
+		base := filepath.Join(root, directory)
+		info, err := os.Lstat(base)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
 		if err != nil {
 			return err
 		}
-		relative, err := filepath.Rel(root, path)
-		if err != nil {
-			return err
+		if !info.IsDir() {
+			return fmt.Errorf("managed cache path is not a directory: %s", directory)
 		}
-		// The state directory contains migration bookkeeping rather than
-		// cached objects. In particular, migration.json must not inflate the
-		// cache size shown in the UI.
-		if entryDir.IsDir() && relative != "." && strings.EqualFold(filepath.ToSlash(relative), "state") {
-			return filepath.SkipDir
-		}
-		if entryDir.IsDir() {
+		if err := filepath.WalkDir(base, func(path string, entryDir fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if entryDir.IsDir() {
+				return nil
+			}
+			if entryDir.Type()&os.ModeSymlink != 0 {
+				return nil
+			}
+			fileInfo, err := entryDir.Info()
+			if err != nil {
+				return err
+			}
+			if fileInfo.Mode().IsRegular() {
+				*total += fileInfo.Size()
+			}
 			return nil
-		}
-		info, err := entryDir.Info()
-		if err != nil {
+		}); err != nil {
 			return err
 		}
-		*total += info.Size()
-		return nil
-	})
+	}
+	return nil
 }

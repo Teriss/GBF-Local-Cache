@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"gbf-local-cache/internal/host"
+	"gbf-local-cache/internal/platform"
 )
 
 type Status struct {
@@ -326,13 +327,7 @@ func atomicWrite(path string, data []byte, mode os.FileMode) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	if err := os.Rename(tmpName, path); err == nil {
-		return nil
-	}
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	return os.Rename(tmpName, path)
+	return platform.ReplaceFile(tmpName, path)
 }
 
 func fingerprint(data []byte, newHash func() hash.Hash) string {

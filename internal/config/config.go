@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"gbf-local-cache/internal/host"
+	"gbf-local-cache/internal/platform"
 )
 
 const CurrentVersion = 1
@@ -158,16 +159,8 @@ func SaveAtomic(path string, cfg Config) error {
 		return fmt.Errorf("close temporary config: %w", err)
 	}
 
-	// os.Rename is atomic when the destination does not exist. Windows does
-	// not replace an existing file with Rename, so the fallback keeps the
-	// operation recoverable while preserving the same-directory temp write.
-	if err := os.Rename(tmpName, path); err != nil {
-		if removeErr := os.Remove(path); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
-			return fmt.Errorf("replace config: %w (remove old config: %v)", err, removeErr)
-		}
-		if retryErr := os.Rename(tmpName, path); retryErr != nil {
-			return fmt.Errorf("rename config: %w", retryErr)
-		}
+	if err := platform.ReplaceFile(tmpName, path); err != nil {
+		return fmt.Errorf("replace config: %w", err)
 	}
 	return nil
 }
