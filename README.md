@@ -47,6 +47,17 @@
 <p align="center">
   <img src="docs/screenshots/overview.png" width="90%" alt="GBF Local Cache 总览">
 </p>
+<p align="center">
+  <img src="docs/screenshots/cache.png" width="49%" alt="缓存管理">
+  <img src="docs/screenshots/network.png" width="49%" alt="网络出口">
+</p>
+<p align="center">
+  <img src="docs/screenshots/security.png" width="49%" alt="安全边界">
+  <img src="docs/screenshots/logs.png" width="49%" alt="实时日志">
+</p>
+<p align="center">
+  <img src="docs/screenshots/settings.png" width="49%" alt="应用设置">
+</p>
 
 ## 构建
 
