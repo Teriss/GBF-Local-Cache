@@ -2,8 +2,10 @@ package cache
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -80,6 +82,154 @@ func TestManagerSingleFlightAndDiskRoundTrip(t *testing.T) {
 	}
 	if origins.Load() != 1 {
 		t.Fatalf("disk hit reached origin: %d", origins.Load())
+	}
+}
+
+func TestManagerLeaderCancellationDoesNotCancelFollowers(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var origins atomic.Int64
+	origin := originFunc(func(ctx context.Context, request *http.Request) (*http.Response, error) {
+		origins.Add(1)
+		close(started)
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		return &http.Response{
+			StatusCode:    http.StatusOK,
+			Header:        http.Header{"Content-Type": []string{"application/octet-stream"}},
+			Body:          io.NopCloser(strings.NewReader("shared-body")),
+			ContentLength: 11,
+		}, nil
+	})
+	manager, err := NewManager(ManagerConfig{Root: t.TempDir(), Origin: origin, Context: context.Background()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, _ := url.Parse("https://static.example.test/shared.bin")
+	firstRequest := &http.Request{Method: http.MethodGet, URL: target, Header: make(http.Header)}
+	firstContext, cancelFirst := context.WithCancel(context.Background())
+	firstRequest = firstRequest.WithContext(firstContext)
+	firstErr := make(chan error, 1)
+	go func() {
+		_, err := manager.Fetch(firstContext, firstRequest)
+		firstErr <- err
+	}()
+	<-started
+	cancelFirst()
+	select {
+	case err := <-firstErr:
+		if err == nil {
+			t.Fatal("canceled leader unexpectedly succeeded")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("leader did not observe request cancellation")
+	}
+	secondResult := make(chan Result, 1)
+	secondErr := make(chan error, 1)
+	go func() {
+		result, err := manager.Fetch(context.Background(), &http.Request{Method: http.MethodGet, URL: target, Header: make(http.Header)})
+		secondResult <- result
+		secondErr <- err
+	}()
+	close(release)
+	select {
+	case err := <-secondErr:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("follower did not complete")
+	}
+	result := <-secondResult
+	if string(result.Body) != "shared-body" {
+		t.Fatalf("follower body = %q", result.Body)
+	}
+	if origins.Load() != 1 {
+		t.Fatalf("origin requests = %d, want 1", origins.Load())
+	}
+}
+
+func TestHeadMissDoesNotDownloadOrCacheBody(t *testing.T) {
+	var method atomic.Value
+	origin := originFunc(func(ctx context.Context, request *http.Request) (*http.Response, error) {
+		method.Store(request.Method)
+		if request.Method == http.MethodHead {
+			return &http.Response{
+				StatusCode:    http.StatusOK,
+				Header:        http.Header{"Content-Length": []string{"123"}, "ETag": []string{`"head-v1"`}},
+				Body:          http.NoBody,
+				ContentLength: 123,
+			}, nil
+		}
+		return &http.Response{
+			StatusCode:    http.StatusOK,
+			Header:        http.Header{"Content-Type": []string{"application/octet-stream"}},
+			Body:          io.NopCloser(strings.NewReader("body")),
+			ContentLength: 4,
+		}, nil
+	})
+	manager, err := NewManager(ManagerConfig{Root: t.TempDir(), Origin: origin})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, _ := url.Parse("https://static.example.test/head.bin")
+	request := &http.Request{Method: http.MethodHead, URL: target, Header: make(http.Header)}
+	result, err := manager.Fetch(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Cacheable || len(result.Body) != 0 || result.Entry.ContentLength != 123 {
+		t.Fatalf("HEAD result = %#v", result)
+	}
+	if got := method.Load(); got != http.MethodHead {
+		t.Fatalf("origin method = %v, want HEAD", got)
+	}
+	recorder := httptest.NewRecorder()
+	WriteResult(recorder, request, result)
+	if recorder.Code != http.StatusOK || recorder.Body.Len() != 0 || recorder.Header().Get("Content-Length") != "123" {
+		t.Fatalf("HEAD response = status %d, body %q, content-length %q", recorder.Code, recorder.Body.String(), recorder.Header().Get("Content-Length"))
+	}
+	_, hash, err := CanonicalKey(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := manager.disk.Read(hash); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("HEAD created a cache entry: %v", err)
+	}
+}
+
+func TestCachedHeadersDropSetCookie(t *testing.T) {
+	origin := originFunc(func(ctx context.Context, request *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header: http.Header{
+				"Content-Type": []string{"application/octet-stream"},
+				"Set-Cookie":   []string{"session=private"},
+			},
+			Body:          io.NopCloser(strings.NewReader("body")),
+			ContentLength: 4,
+		}, nil
+	})
+	manager, err := NewManager(ManagerConfig{Root: t.TempDir(), Origin: origin})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, _ := url.Parse("https://static.example.test/cookie.bin")
+	request := &http.Request{Method: http.MethodGet, URL: target, Header: make(http.Header)}
+	result, err := manager.Fetch(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Entry.Headers.Get("Set-Cookie") != "" {
+		t.Fatal("Set-Cookie was retained in cache metadata")
+	}
+	recorder := httptest.NewRecorder()
+	WriteResult(recorder, request, result)
+	if recorder.Header().Get("Set-Cookie") != "" {
+		t.Fatal("Set-Cookie was sent from cached response")
 	}
 }
 

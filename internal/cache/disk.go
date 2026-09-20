@@ -18,10 +18,11 @@ type RootSet struct {
 	mu       sync.RWMutex
 	primary  string
 	fallback string
+	version  uint64
 }
 
 func NewRootSet(primary string) *RootSet {
-	return &RootSet{primary: filepath.Clean(primary)}
+	return &RootSet{primary: filepath.Clean(primary), version: 1}
 }
 
 func (r *RootSet) Roots() (primary, fallback string) {
@@ -30,16 +31,24 @@ func (r *RootSet) Roots() (primary, fallback string) {
 	return r.primary, r.fallback
 }
 
+func (r *RootSet) Version() uint64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.version
+}
+
 func (r *RootSet) BeginMigration(newRoot, oldRoot string) {
 	r.mu.Lock()
 	r.primary = filepath.Clean(newRoot)
 	r.fallback = filepath.Clean(oldRoot)
+	r.version++
 	r.mu.Unlock()
 }
 
 func (r *RootSet) FinishMigration() {
 	r.mu.Lock()
 	r.fallback = ""
+	r.version++
 	r.mu.Unlock()
 }
 
@@ -47,13 +56,19 @@ func (r *RootSet) RestoreFallback() {
 	r.mu.Lock()
 	if r.fallback != "" {
 		r.primary, r.fallback = r.fallback, r.primary
+		r.version++
 	}
 	r.mu.Unlock()
 }
 
 type DiskStore struct {
-	roots  *RootSet
-	writes sync.WaitGroup
+	roots       *RootSet
+	writes      sync.WaitGroup
+	writeSlots  chan struct{}
+	sizeMu      sync.Mutex
+	cachedSize  int64
+	sizeVersion uint64
+	sizeReady   bool
 }
 
 type HealthReport struct {
@@ -70,7 +85,9 @@ func NewDiskStore(roots *RootSet) *DiskStore {
 	if roots == nil {
 		roots = NewRootSet("")
 	}
-	return &DiskStore{roots: roots}
+	store := &DiskStore{roots: roots, writeSlots: make(chan struct{}, 4)}
+	store.RefreshSize()
+	return store
 }
 
 func (s *DiskStore) Roots() *RootSet {
@@ -104,6 +121,8 @@ func (s *DiskStore) PutAsync(hash string, entry CacheEntry, body []byte) {
 	s.writes.Add(1)
 	go func() {
 		defer s.writes.Done()
+		s.writeSlots <- struct{}{}
+		defer func() { <-s.writeSlots }()
 		_ = s.Put(hash, entry, bodyCopy)
 	}()
 }
@@ -112,11 +131,25 @@ func (s *DiskStore) Put(hash string, entry CacheEntry, body []byte) error {
 	if !validHash(hash) {
 		return fmt.Errorf("invalid cache hash %q", hash)
 	}
+	s.sizeMu.Lock()
+	defer s.sizeMu.Unlock()
 	primary, _ := s.roots.Roots()
 	if primary == "" {
 		return errors.New("cache root is empty")
 	}
-	return writeObject(primary, hash, entry, body)
+	version := s.roots.Version()
+	before := cacheFileSize(primary, hash)
+	if err := writeObject(primary, hash, entry, body); err != nil {
+		s.sizeReady = false
+		return err
+	}
+	after := cacheFileSize(primary, hash)
+	if s.sizeReady && s.sizeVersion == version && s.roots.Version() == version {
+		s.cachedSize += after - before
+	} else {
+		s.sizeReady = false
+	}
+	return nil
 }
 
 func (s *DiskStore) Promote(hash string, entry CacheEntry, body []byte) {
@@ -141,6 +174,8 @@ func (s *DiskStore) Wait(ctx context.Context) error {
 }
 
 func (s *DiskStore) Clear() error {
+	s.sizeMu.Lock()
+	defer s.sizeMu.Unlock()
 	primary, fallback := s.roots.Roots()
 	for _, root := range []string{primary, fallback} {
 		if root == "" {
@@ -159,7 +194,62 @@ func (s *DiskStore) Clear() error {
 			return err
 		}
 	}
+	s.sizeReady = false
 	return nil
+}
+
+// DiskSize returns a cached total. The initial value is calculated once when
+// the store is created; writes adjust it incrementally and root-set changes
+// invalidate it. This keeps frequent UI snapshots from walking the whole
+// cache tree.
+func (s *DiskStore) DiskSize() int64 {
+	version := s.roots.Version()
+	s.sizeMu.Lock()
+	defer s.sizeMu.Unlock()
+	if !s.sizeReady || s.sizeVersion != version {
+		s.cachedSize = s.calculateSize()
+		s.sizeVersion = s.roots.Version()
+		s.sizeReady = true
+	}
+	return s.cachedSize
+}
+
+// RefreshSize performs an explicit full recalculation. It is useful after an
+// external migration worker has copied files outside DiskStore.Put.
+func (s *DiskStore) RefreshSize() {
+	s.sizeMu.Lock()
+	defer s.sizeMu.Unlock()
+	s.cachedSize = s.calculateSize()
+	s.sizeVersion = s.roots.Version()
+	s.sizeReady = true
+}
+
+func (s *DiskStore) calculateSize() int64 {
+	primary, fallback := s.roots.Roots()
+	seen := make(map[string]struct{}, 2)
+	var total int64
+	for _, root := range []string{primary, fallback} {
+		if root == "" {
+			continue
+		}
+		key := strings.ToLower(filepath.Clean(root))
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		_ = walkSize(root, &total)
+	}
+	return total
+}
+
+func cacheFileSize(root, hash string) int64 {
+	var total int64
+	for _, path := range []string{objectPath(root, hash), metadataPath(root, hash)} {
+		if info, err := os.Stat(path); err == nil && info.Mode().IsRegular() {
+			total += info.Size()
+		}
+	}
+	return total
 }
 
 func (s *DiskStore) Inspect(ctx context.Context) (HealthReport, error) {

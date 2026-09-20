@@ -1,8 +1,10 @@
 package cert
 
 import (
+	"crypto/tls"
 	"crypto/x509"
 	"testing"
+	"time"
 )
 
 func TestManagerCreatesRootAndLeafCertificate(t *testing.T) {
@@ -26,5 +28,30 @@ func TestManagerCreatesRootAndLeafCertificate(t *testing.T) {
 	}
 	if _, err := x509.ParseCertificate(certificate.Certificate[1]); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestManagerRenewsLeafCertificateNearExpiry(t *testing.T) {
+	manager := New(t.TempDir())
+	first, err := manager.CertificateFor("static.example.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.mu.Lock()
+	manager.leaf["static.example.test"] = tls.Certificate{
+		Certificate: first.Certificate,
+		PrivateKey:  first.PrivateKey,
+		Leaf:        &x509.Certificate{NotAfter: time.Now().Add(30 * time.Minute)},
+	}
+	manager.mu.Unlock()
+	second, err := manager.CertificateFor("static.example.test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first.Certificate) == 0 || len(second.Certificate) == 0 || string(first.Certificate[0]) == string(second.Certificate[0]) {
+		t.Fatal("leaf certificate was not renewed")
+	}
+	if !second.Leaf.NotAfter.After(time.Now().Add(23 * time.Hour)) {
+		t.Fatalf("renewed leaf expires too soon: %s", second.Leaf.NotAfter)
 	}
 }

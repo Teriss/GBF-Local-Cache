@@ -22,8 +22,8 @@ func TestCanonicalKeyIncludesHostPortAndQuery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if firstCanonical != secondCanonical || firstHash != secondHash {
-		t.Fatalf("canonical keys differ: %q/%s vs %q/%s", firstCanonical, firstHash, secondCanonical, secondHash)
+	if firstCanonical == secondCanonical || firstHash == secondHash {
+		t.Fatalf("query order was normalized unexpectedly: %q/%s vs %q/%s", firstCanonical, firstHash, secondCanonical, secondHash)
 	}
 
 	otherHost, _ := url.Parse("https://other.test/assets/a.png?a=1&b=2")

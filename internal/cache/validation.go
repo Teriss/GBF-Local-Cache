@@ -14,7 +14,7 @@ import (
 )
 
 func newEntry(target *url.URL, response *http.Response, body []byte) CacheEntry {
-	headers := response.Header.Clone()
+	headers := SanitizeHeaders(response.Header)
 	if headers == nil {
 		headers = make(http.Header)
 	}
@@ -22,19 +22,37 @@ func newEntry(target *url.URL, response *http.Response, body []byte) CacheEntry 
 	if mediaType, _, err := mime.ParseMediaType(contentType); err == nil {
 		contentType = mediaType
 	}
-	digest := sha256.Sum256(body)
+	contentLength := int64(len(body))
+	if body == nil {
+		contentLength = response.ContentLength
+		if contentLength < 0 {
+			if value := headers.Get("Content-Length"); value != "" {
+				if parsed, err := strconv.ParseInt(value, 10, 64); err == nil && parsed >= 0 {
+					contentLength = parsed
+				}
+			}
+		}
+		if contentLength < 0 {
+			contentLength = 0
+		}
+	}
+	sha := ""
+	if len(body) > 0 {
+		digest := sha256.Sum256(body)
+		sha = hex.EncodeToString(digest[:])
+	}
 	now := time.Now()
 	return CacheEntry{
 		Version:       MetadataVersion,
 		URL:           target.String(),
 		Host:          target.Hostname(),
 		ContentType:   contentType,
-		ContentLength: int64(len(body)),
+		ContentLength: contentLength,
 		StatusCode:    response.StatusCode,
 		Headers:       headers,
 		ETag:          headers.Get("ETag"),
 		LastModified:  headers.Get("Last-Modified"),
-		SHA256:        hex.EncodeToString(digest[:]),
+		SHA256:        sha,
 		CreatedAt:     now,
 		LastAccessed:  now,
 	}

@@ -93,8 +93,19 @@ func (m *Manager) Roots() *cache.RootSet {
 // before switching roots, so a malformed source or an invalid target cannot
 // leave the service in a half-switched state.
 func (m *Manager) Start(parent context.Context, oldRoot, newRoot string, callback func(Status)) error {
-	if parent == nil {
-		parent = context.Background()
+	return m.StartWithWorker(parent, parent, oldRoot, newRoot, callback)
+}
+
+// StartWithWorker starts a migration using scanContext for the synchronous
+// validation/scan and workerContext for the background copy. Keeping these
+// contexts separate prevents a short-lived RPC timeout from canceling a
+// migration after the RPC has already returned successfully.
+func (m *Manager) StartWithWorker(scanContext, workerContext context.Context, oldRoot, newRoot string, callback func(Status)) error {
+	if scanContext == nil {
+		scanContext = context.Background()
+	}
+	if workerContext == nil {
+		workerContext = context.Background()
 	}
 	oldRoot, err := absoluteClean(oldRoot)
 	if err != nil {
@@ -124,11 +135,11 @@ func (m *Manager) Start(parent context.Context, oldRoot, newRoot string, callbac
 	}
 	m.mu.Unlock()
 
-	files, totalBytes, err := scanFiles(oldRoot)
+	files, totalBytes, err := scanFiles(scanContext, oldRoot)
 	if err != nil {
 		return fmt.Errorf("scan old cache root: %w", err)
 	}
-	ctx, cancel := context.WithCancel(parent)
+	ctx, cancel := context.WithCancel(workerContext)
 	m.mu.Lock()
 	m.cancel = cancel
 	m.done = make(chan struct{})
@@ -159,6 +170,17 @@ func (m *Manager) Start(parent context.Context, oldRoot, newRoot string, callbac
 // still the configured root after an interrupted run, so it remains safe to
 // serve from it while the destination is rebuilt and verified.
 func (m *Manager) Recover(parent context.Context, configuredOldRoot string, callback func(Status)) (bool, error) {
+	return m.RecoverWithWorker(parent, parent, configuredOldRoot, callback)
+}
+
+// RecoverWithWorker is the restart counterpart of StartWithWorker.
+func (m *Manager) RecoverWithWorker(scanContext, workerContext context.Context, configuredOldRoot string, callback func(Status)) (bool, error) {
+	if scanContext == nil {
+		scanContext = context.Background()
+	}
+	if workerContext == nil {
+		workerContext = context.Background()
+	}
 	configuredOldRoot, err := absoluteClean(configuredOldRoot)
 	if err != nil {
 		return false, err
@@ -183,7 +205,7 @@ func (m *Manager) Recover(parent context.Context, configuredOldRoot string, call
 	if !samePath(saved.Status.OldRoot, configuredOldRoot) {
 		return false, errors.New("migration state does not belong to the configured cache root")
 	}
-	if err := m.Start(parent, saved.Status.OldRoot, saved.Status.NewRoot, callback); err != nil {
+	if err := m.StartWithWorker(scanContext, workerContext, saved.Status.OldRoot, saved.Status.NewRoot, callback); err != nil {
 		return false, err
 	}
 	m.log(logging.CategoryMigration, "resumed migration after process restart")
@@ -388,10 +410,15 @@ func (m *Manager) log(category logging.Category, message string) {
 	}
 }
 
-func scanFiles(root string) ([]fileRecord, int64, error) {
+func scanFiles(ctx context.Context, root string) ([]fileRecord, int64, error) {
 	var files []fileRecord
 	var total int64
 	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
 		if err != nil {
 			return err
 		}
@@ -429,8 +456,8 @@ func verifyMigration(root string, files []fileRecord) error {
 		if err != nil {
 			return fmt.Errorf("verify %s: %w", file.Relative, err)
 		}
-		if info.Size() != file.Size {
-			return fmt.Errorf("verify %s: size %d, want %d", file.Relative, info.Size(), file.Size)
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("verify %s: destination is not a regular file", file.Relative)
 		}
 	}
 	return nil
@@ -438,6 +465,17 @@ func verifyMigration(root string, files []fileRecord) error {
 
 func copyAndVerify(ctx context.Context, source, destination string, expectedSize int64) error {
 	if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
+		return err
+	}
+	// A cache write can legitimately create this path after the migration scan.
+	// Never replace an existing destination: preserving the newer atomically
+	// written value is safer than overwriting it with an older source value.
+	if info, err := os.Stat(destination); err == nil {
+		if info.Mode().IsRegular() {
+			return nil
+		}
+		return fmt.Errorf("migration destination is not a regular file: %s", destination)
+	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	in, err := os.Open(source)
@@ -468,8 +506,12 @@ func copyAndVerify(ctx context.Context, source, destination string, expectedSize
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	if err := replaceFile(tmpName, destination); err != nil {
+	installed, err := installIfAbsent(tmpName, destination)
+	if err != nil {
 		return err
+	}
+	if !installed {
+		return nil
 	}
 	destinationDigest, err := hashFile(destination)
 	if err != nil {
@@ -484,6 +526,31 @@ func copyAndVerify(ctx context.Context, source, destination string, expectedSize
 	default:
 		return nil
 	}
+}
+
+func installIfAbsent(source, destination string) (bool, error) {
+	// Linking a completed temporary file is atomic and, unlike rename, fails
+	// when another writer has already created the destination.
+	if err := os.Link(source, destination); err == nil {
+		return true, os.Remove(source)
+	} else if !errors.Is(err, os.ErrExist) && !errors.Is(err, os.ErrNotExist) {
+		return false, err
+	}
+	if _, err := os.Stat(destination); err == nil {
+		return false, os.Remove(source)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return false, err
+	}
+	// Some filesystems do not support hard links. On those filesystems rename
+	// is still safe on Windows (the target cannot be replaced by Rename), and
+	// the existence check handles a concurrent creator.
+	if err := os.Rename(source, destination); err == nil {
+		return true, nil
+	}
+	if _, err := os.Stat(destination); err == nil {
+		return false, os.Remove(source)
+	}
+	return false, fmt.Errorf("install migration file %s: %w", destination, os.ErrExist)
 }
 
 func hashFile(path string) (string, error) {

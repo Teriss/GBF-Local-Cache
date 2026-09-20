@@ -43,6 +43,7 @@ type ManagerConfig struct {
 	RAMBytes       int64
 	RAMObjectBytes int64
 	MaxObjectBytes int64
+	Context        context.Context
 	Origin         OriginClient
 	Stats          *stats.Stats
 	Logs           *logging.Ring
@@ -58,6 +59,8 @@ type Manager struct {
 	logs          *logging.Ring
 	flight        singleflight.Group
 	writes        sync.WaitGroup
+	lifecycle     context.Context
+	writeSlots    chan struct{}
 }
 
 func NewManager(cfg ManagerConfig) (*Manager, error) {
@@ -85,6 +88,9 @@ func NewManager(cfg ManagerConfig) (*Manager, error) {
 	if cfg.Logs == nil {
 		cfg.Logs = logging.NewRing(5000)
 	}
+	if cfg.Context == nil {
+		cfg.Context = context.Background()
+	}
 	return &Manager{
 		disk:          NewDiskStore(cfg.Roots),
 		ram:           NewRAMCache(cfg.RAMBytes, cfg.RAMObjectBytes),
@@ -92,6 +98,8 @@ func NewManager(cfg ManagerConfig) (*Manager, error) {
 		origin:        cfg.Origin,
 		stats:         cfg.Stats,
 		logs:          cfg.Logs,
+		lifecycle:     cfg.Context,
+		writeSlots:    make(chan struct{}, 4),
 	}, nil
 }
 
@@ -123,15 +131,17 @@ func (m *Manager) Fetch(ctx context.Context, request *http.Request) (Result, err
 	}
 	if entry, body, ok := m.ram.Get(hash); ok {
 		m.stats.RamHit()
-		m.stats.AddCacheBytesServed(int64(len(body)))
-		m.stats.AddBytesSaved(int64(len(body)))
+		served := servedBytes(request, entry, body)
+		m.stats.AddCacheBytesServed(served)
+		m.stats.AddBytesSaved(served)
 		m.log(logging.CategoryHit, request, "RAM", len(body))
 		return Result{Key: hash, Canonical: canonical, Entry: entry, Body: body, Source: SourceRAM, Cacheable: true}, nil
 	}
 	if entry, body, root, diskErr := m.disk.Read(hash); diskErr == nil {
 		m.stats.DiskHit()
-		m.stats.AddCacheBytesServed(int64(len(body)))
-		m.stats.AddBytesSaved(int64(len(body)))
+		served := servedBytes(request, entry, body)
+		m.stats.AddCacheBytesServed(served)
+		m.stats.AddBytesSaved(served)
 		m.ram.Put(hash, entry, body)
 		primary, _ := m.disk.Roots().Roots()
 		if root != primary {
@@ -141,7 +151,7 @@ func (m *Manager) Fetch(ctx context.Context, request *http.Request) (Result, err
 		return Result{Key: hash, Canonical: canonical, Entry: entry, Body: body, Source: SourceDisk, Cacheable: true}, nil
 	}
 
-	value, err, _ := m.flight.Do(hash, func() (any, error) {
+	resultChannel := m.flight.DoChan(hash, func() (any, error) {
 		// Another request may have populated RAM while this goroutine waited
 		// to enter the singleflight function.
 		if entry, body, ok := m.ram.Get(hash); ok {
@@ -151,12 +161,18 @@ func (m *Manager) Fetch(ctx context.Context, request *http.Request) (Result, err
 			m.ram.Put(hash, entry, body)
 			return Result{Key: hash, Canonical: canonical, Entry: entry, Body: body, Source: SourceDisk, Cacheable: true}, nil
 		}
-		return m.fetchOrigin(ctx, request, hash, canonical)
+		return m.fetchOrigin(m.lifecycle, request, hash, canonical)
 	})
-	if err != nil {
-		return Result{}, err
+	var resultValue singleflight.Result
+	select {
+	case resultValue = <-resultChannel:
+	case <-ctx.Done():
+		return Result{}, ctx.Err()
 	}
-	result, ok := value.(Result)
+	if resultValue.Err != nil {
+		return Result{}, resultValue.Err
+	}
+	result, ok := resultValue.Val.(Result)
 	if !ok {
 		return Result{}, errors.New("invalid singleflight result")
 	}
@@ -169,10 +185,10 @@ func (m *Manager) Fetch(ctx context.Context, request *http.Request) (Result, err
 func (m *Manager) fetchOrigin(ctx context.Context, request *http.Request, hash, canonical string) (Result, error) {
 	m.stats.Miss()
 	originRequest := request.Clone(ctx)
-	originRequest.Method = http.MethodGet
+	originRequest.Method = request.Method
 	originRequest.RequestURI = ""
 	originRequest.Header = request.Header.Clone()
-	for _, key := range []string{"Range", "If-Range", "If-None-Match", "If-Modified-Since", "If-Unmodified-Since", "If-Match", "Cookie", "Authorization"} {
+	for _, key := range []string{"Range", "If-Range", "If-None-Match", "If-Modified-Since", "If-Unmodified-Since", "If-Match", "Cookie", "Authorization", "Proxy-Authorization"} {
 		originRequest.Header.Del(key)
 	}
 	// Cache bytes are stored and served byte-for-byte. Asking for identity
@@ -183,7 +199,19 @@ func (m *Manager) fetchOrigin(ctx context.Context, request *http.Request, hash, 
 		m.stats.Error()
 		return Result{}, err
 	}
-	if response == nil || response.Body == nil {
+	if response == nil {
+		m.stats.Error()
+		return Result{}, errors.New("origin returned an empty response")
+	}
+	if request.Method == http.MethodHead {
+		if response.Body != nil {
+			defer response.Body.Close()
+		}
+		entry := newEntry(request.URL, response, nil)
+		m.log(logging.CategoryMiss, request, "origin", 0)
+		return Result{Key: hash, Canonical: canonical, Entry: entry, Source: SourceOrigin, Cacheable: false}, nil
+	}
+	if response.Body == nil {
 		m.stats.Error()
 		return Result{}, errors.New("origin returned an empty response")
 	}
@@ -218,6 +246,12 @@ func (m *Manager) fetchOrigin(ctx context.Context, request *http.Request, hash, 
 	m.writes.Add(1)
 	go func() {
 		defer m.writes.Done()
+		select {
+		case m.writeSlots <- struct{}{}:
+			defer func() { <-m.writeSlots }()
+		case <-m.lifecycle.Done():
+			return
+		}
 		if err := m.disk.Put(hash, entry, body); err != nil {
 			m.stats.Error()
 			m.log(logging.CategoryError, request, "disk store failed: "+err.Error(), len(body))
@@ -277,10 +311,27 @@ func (m *Manager) log(category logging.Category, request *http.Request, message 
 
 func SanitizeHeaders(headers http.Header) http.Header {
 	result := headers.Clone()
-	for _, key := range []string{"Cookie", "Authorization", "Proxy-Authorization", "Set-Cookie"} {
+	for _, key := range []string{"Cookie", "Authorization", "Proxy-Authorization", "Set-Cookie", "Set-Cookie2"} {
 		result.Del(key)
 	}
 	return result
+}
+
+func servedBytes(request *http.Request, entry CacheEntry, body []byte) int64 {
+	if request == nil || request.Method == http.MethodHead || entry.StatusCode == http.StatusNotModified {
+		return 0
+	}
+	if entry.StatusCode != http.StatusOK || len(body) == 0 {
+		return int64(len(body))
+	}
+	if value := request.Header.Get("Range"); value != "" && ifRangeMatches(request, entry) {
+		byteRange, err := ParseRange(value, int64(len(body)))
+		if err != nil {
+			return 0
+		}
+		return byteRange.Length()
+	}
+	return int64(len(body))
 }
 
 func IsStaticContentType(value string) bool {
@@ -289,15 +340,7 @@ func IsStaticContentType(value string) bool {
 }
 
 func (m *Manager) DiskSize() int64 {
-	primary, fallback := m.disk.Roots().Roots()
-	var total int64
-	for _, root := range []string{primary, fallback} {
-		if root == "" {
-			continue
-		}
-		_ = walkSize(root, &total)
-	}
-	return total
+	return m.disk.DiskSize()
 }
 
 func walkSize(root string, total *int64) error {

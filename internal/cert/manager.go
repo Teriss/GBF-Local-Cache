@@ -45,6 +45,8 @@ type Manager struct {
 	installKnown bool
 }
 
+const leafRenewalWindow = time.Hour
+
 func DefaultDirectory() (string, error) {
 	base := os.Getenv("LOCALAPPDATA")
 	if base == "" {
@@ -139,7 +141,9 @@ func (m *Manager) CertificateFor(hostname string) (tls.Certificate, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if certificate, ok := m.leaf[hostname]; ok {
-		return certificate, nil
+		if certificate.Leaf != nil && time.Now().Before(certificate.Leaf.NotAfter.Add(-leafRenewalWindow)) {
+			return certificate, nil
+		}
 	}
 	serial, err := randomSerial()
 	if err != nil {
@@ -224,8 +228,29 @@ func (m *Manager) Uninstall() error {
 }
 
 func (m *Manager) Regenerate() error {
+	if err := m.Ensure(); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	oldCertificate := m.caCert
+	oldInstalled := false
+	if oldCertificate != nil && runtime.GOOS == "windows" {
+		// Regeneration must inspect the store instead of trusting the cached
+		// flag: the user may have installed or removed the CA outside this app.
+		m.installed = isInstalled(oldCertificate)
+		m.installKnown = true
+		oldInstalled = m.installed
+	}
+	oldThumbprint := ""
+	if oldCertificate != nil {
+		oldThumbprint = fingerprint(oldCertificate.Raw, sha1.New)
+	}
+	if oldInstalled && runtime.GOOS == "windows" {
+		if output, err := runCertificateCommand("certutil.exe", "-delstore", "-user", "Root", oldThumbprint); err != nil {
+			return fmt.Errorf("remove previous Root CA: %w: %s", err, strings.TrimSpace(string(output)))
+		}
+	}
 	if err := os.Remove(filepath.Join(m.directory, "ca.crt")); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
@@ -236,7 +261,18 @@ func (m *Manager) Regenerate() error {
 	m.leaf = make(map[string]tls.Certificate)
 	m.installed = false
 	m.installKnown = true
-	return m.generateLocked()
+	if err := m.generateLocked(); err != nil {
+		return err
+	}
+	if oldInstalled && runtime.GOOS == "windows" {
+		path := filepath.Join(m.directory, "ca.crt")
+		if output, err := runCertificateCommand("certutil.exe", "-addstore", "-user", "Root", path); err != nil {
+			return fmt.Errorf("install regenerated Root CA: %w: %s", err, strings.TrimSpace(string(output)))
+		}
+		m.installed = true
+		m.installKnown = true
+	}
+	return nil
 }
 
 func parseCA(certPEM, keyPEM []byte) (*x509.Certificate, *ecdsa.PrivateKey, time.Time, error) {

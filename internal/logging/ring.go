@@ -58,6 +58,13 @@ func (r *Ring) Add(entry Entry) {
 }
 
 func (r *Ring) Snapshot() []Entry {
+	return r.Recent(0)
+}
+
+// Recent returns the newest limit entries in chronological order. A non-
+// positive limit returns the complete ring. Keeping the limit in the backend
+// prevents every UI snapshot from serializing the full ring buffer.
+func (r *Ring) Recent(limit int) []Entry {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
@@ -66,6 +73,10 @@ func (r *Ring) Snapshot() []Entry {
 	if r.full {
 		count = len(r.entries)
 		start = r.next
+	}
+	if limit > 0 && count > limit {
+		start = (start + count - limit) % len(r.entries)
+		count = limit
 	}
 	result := make([]Entry, 0, count)
 	for i := 0; i < count; i++ {

@@ -50,29 +50,34 @@ type Snapshot struct {
 }
 
 type Service struct {
-	mu        sync.RWMutex
-	state     State
-	lastError string
-	config    config.Config
-	listener  *proxy.Listener
-	handler   *proxy.Server
-	origin    *network.Manager
-	cache     *cache.Manager
-	ca        *cert.Manager
-	migration *migration.Manager
-	stats     *stats.Stats
-	logs      *logging.Ring
+	mu              sync.RWMutex
+	state           State
+	lastError       string
+	config          config.Config
+	listener        *proxy.Listener
+	handler         *proxy.Server
+	origin          *network.Manager
+	cache           *cache.Manager
+	ca              *cert.Manager
+	migration       *migration.Manager
+	stats           *stats.Stats
+	logs            *logging.Ring
+	migrationCtx    context.Context
+	migrationCancel context.CancelFunc
 }
 
 func New(cfg config.Config) (*Service, error) {
 	if err := config.Validate(cfg); err != nil {
 		return nil, err
 	}
+	migrationCtx, migrationCancel := context.WithCancel(context.Background())
 	return &Service{
-		state:  StateStopped,
-		config: cfg,
-		stats:  &stats.Stats{},
-		logs:   logging.NewRing(5000),
+		state:           StateStopped,
+		config:          cfg,
+		stats:           &stats.Stats{},
+		logs:            logging.NewRing(5000),
+		migrationCtx:    migrationCtx,
+		migrationCancel: migrationCancel,
 	}, nil
 }
 
@@ -95,6 +100,10 @@ func (s *Service) Start(ctx context.Context) error {
 	activeMigration := s.migration
 	if activeMigration == nil || (activeMigration.Status().State != migration.StateRunning && activeMigration.Status().State != migration.StatePaused) {
 		activeMigration = nil
+	}
+	migrationCtx := s.migrationCtx
+	if migrationCtx == nil {
+		migrationCtx = context.Background()
 	}
 	s.mu.Unlock()
 
@@ -121,6 +130,7 @@ func (s *Service) Start(ctx context.Context) error {
 		Origin:         origin,
 		Stats:          s.stats,
 		Logs:           s.logs,
+		Context:        ctx,
 	}
 	if activeMigration != nil && activeMigration.Roots() != nil {
 		managerConfig.Roots = activeMigration.Roots()
@@ -172,7 +182,7 @@ func (s *Service) Start(ctx context.Context) error {
 	if activeMigration != nil {
 		return nil
 	}
-	if recovered, recoverErr := migrator.Recover(ctx, cfg.CacheRoot, resumeCallback); recoverErr != nil {
+	if recovered, recoverErr := migrator.RecoverWithWorker(ctx, migrationCtx, cfg.CacheRoot, resumeCallback); recoverErr != nil {
 		s.logs.Add(logging.Entry{Category: logging.CategoryMigration, Message: "migration recovery skipped: " + recoverErr.Error()})
 	} else if recovered {
 		s.logs.Add(logging.Entry{Category: logging.CategoryMigration, Message: "migration recovery started"})
@@ -236,6 +246,10 @@ func (s *Service) Stop(ctx context.Context) error {
 	}
 
 	s.mu.Lock()
+	if s.migrationCancel != nil {
+		s.migrationCancel()
+	}
+	s.migrationCtx, s.migrationCancel = context.WithCancel(context.Background())
 	s.listener = nil
 	s.handler = nil
 	s.origin = nil
@@ -301,7 +315,7 @@ func (s *Service) Snapshot() Snapshot {
 		Stats:         s.stats.Snapshot(),
 		Certificate:   certificateStatus(ca),
 		Migration:     migrationStatus,
-		Logs:          s.logs.Snapshot(),
+		Logs:          s.logs.Recent(200),
 		Error:         lastError,
 	}
 }
@@ -484,6 +498,10 @@ func (s *Service) ChangeCacheRoot(ctx context.Context, newRoot string) error {
 	oldRoot := s.config.CacheRoot
 	manager := s.cache
 	migrator := s.migration
+	migrationCtx := s.migrationCtx
+	if migrationCtx == nil {
+		migrationCtx = context.Background()
+	}
 	s.mu.RUnlock()
 	oldRoot, _ = filepath.Abs(filepath.Clean(oldRoot))
 	if strings.EqualFold(oldRoot, newRoot) {
@@ -542,7 +560,7 @@ func (s *Service) ChangeCacheRoot(ctx context.Context, newRoot string) error {
 		}
 		s.mu.Unlock()
 	}
-	if err := migrator.Start(ctx, oldRoot, newRoot, callback); err != nil {
+	if err := migrator.StartWithWorker(ctx, migrationCtx, oldRoot, newRoot, callback); err != nil {
 		return err
 	}
 	s.logs.Add(logging.Entry{Category: logging.CategoryMigration, Message: "cache migration started while service is stopped or running"})

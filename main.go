@@ -18,10 +18,19 @@ import (
 var frontendAssets embed.FS
 
 func main() {
+	releaseInstance, alreadyRunning, err := acquireSingleInstance()
+	if err != nil {
+		log.Fatal(err)
+	}
+	if alreadyRunning {
+		return
+	}
+	defer releaseInstance()
+
 	app := NewApp()
 	startHidden := hasBackgroundFlag()
 
-	err := wails.Run(&options.App{
+	err = wails.Run(&options.App{
 		Title:             "GBF Local Cache",
 		Width:             1180,
 		Height:            760,

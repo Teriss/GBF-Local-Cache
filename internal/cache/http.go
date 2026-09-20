@@ -112,7 +112,11 @@ func WriteResult(writer http.ResponseWriter, request *http.Request, result Resul
 			writer.Header().Set("Content-Length", strconv.Itoa(len(body)))
 		}
 	} else {
-		writer.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		contentLength := result.Entry.ContentLength
+		if contentLength < 0 {
+			contentLength = int64(len(body))
+		}
+		writer.Header().Set("Content-Length", strconv.FormatInt(contentLength, 10))
 	}
 
 	writer.WriteHeader(status)
@@ -163,7 +167,7 @@ func etagMatches(header, etag string) bool {
 
 func copyHeaders(destination, source http.Header) {
 	for key, values := range source {
-		if isHopByHop(key) || strings.EqualFold(key, "Content-Length") {
+		if isHopByHop(key) || strings.EqualFold(key, "Content-Length") || strings.EqualFold(key, "Set-Cookie") || strings.EqualFold(key, "Set-Cookie2") {
 			continue
 		}
 		for _, value := range values {
