@@ -127,6 +127,9 @@ type BackendApp = {
   RegenerateCertificate?: () => Promise<void>
   GetStartupEnabled?: () => Promise<boolean>
   SetStartupEnabled?: (enabled: boolean) => Promise<void>
+  GetCloseBehavior?: () => Promise<string>
+  SetCloseBehavior?: (behavior: string) => Promise<void>
+  SetListenPort?: (port: number) => Promise<void>
 }
 
 type Notify = (message: string, kind?: NoticeKind) => void
@@ -543,10 +546,26 @@ function LogsPage({ snapshot, onRefresh, onClearLogs }: { snapshot: Snapshot; on
 function SettingsPage({ snapshot, backend, theme, onThemeChange, onOpenConfigFolder, onNotify }: { snapshot: Snapshot; backend?: BackendApp; theme: Theme; onThemeChange: () => void; onOpenConfigFolder: () => void; onNotify: Notify }) {
   const [startupEnabled, setStartupEnabled] = useState(false)
   const [startupWorking, setStartupWorking] = useState(false)
+  const [portValue, setPortValue] = useState('8124')
+  const [portDirty, setPortDirty] = useState(false)
+  const [portWorking, setPortWorking] = useState(false)
+  const [closeBehavior, setCloseBehavior] = useState<'tray' | 'exit'>('tray')
+  const [closeWorking, setCloseWorking] = useState(false)
+
+  const listenPort = snapshot.listen_address.split(':').pop() || '8124'
 
   useEffect(() => {
     if (!backend?.GetStartupEnabled) return
     void backend.GetStartupEnabled().then(setStartupEnabled).catch((error) => onNotify(`读取开机自启状态失败：${errorText(error)}`, 'error'))
+  }, [backend])
+
+  useEffect(() => {
+    if (!portDirty) setPortValue(listenPort)
+  }, [listenPort, portDirty])
+
+  useEffect(() => {
+    if (!backend?.GetCloseBehavior) return
+    void backend.GetCloseBehavior().then((value) => setCloseBehavior(value === 'exit' ? 'exit' : 'tray')).catch((error) => onNotify(`读取关闭行为失败：${errorText(error)}`, 'error'))
   }, [backend])
 
   const toggleStartup = async () => {
@@ -562,7 +581,34 @@ function SettingsPage({ snapshot, backend, theme, onThemeChange, onOpenConfigFol
     } finally { setStartupWorking(false) }
   }
 
-  return <div className="page-grid"><section className="panel large-panel settings-panel"><div className="panel-heading"><div><span className="section-label">APPLICATION</span><h2>设置</h2></div></div><div className="detail-list"><div><span>版本</span><strong>1.0.0</strong></div><div><span>本地代理端口</span><strong>{snapshot.listen_address}</strong></div><div><span>缓存路径</span><strong title={snapshot.cache_root}>{snapshot.cache_root || '—'}</strong></div><div><span>配置文件</span><strong>%LOCALAPPDATA%\GBFLocalCache\config.json</strong></div></div><div className="setting-list"><div className="setting-row"><div><strong>开机自启</strong><small>登录 Windows 后自动启动服务，并隐藏到右下角托盘。</small></div><button className={`switch-control ${startupEnabled ? 'active' : ''}`} role="switch" aria-checked={startupEnabled} onClick={() => void toggleStartup()} disabled={startupWorking}><span /></button></div><div className="setting-row"><div><strong>关闭窗口</strong><small>点击右上角 X 只隐藏面板，服务继续在托盘后台运行。</small></div><span className="setting-value">托盘后台</span></div></div><div className="action-row"><button className="secondary-button" onClick={onOpenConfigFolder}><ExternalLink size={16} />打开配置目录</button><button className="secondary-button" onClick={onThemeChange}>{theme === 'light' ? <Moon size={16} /> : <Sun size={16} />}{theme === 'light' ? '切换深色主题' : '切换浅色主题'}</button><button className="secondary-button" onClick={() => onNotify('配置写入采用临时文件、flush、fsync 后原子替换。', 'success')}><Settings size={16} />配置说明</button></div></section></div>
+  const applyPort = async () => {
+    if (!backend?.SetListenPort) return onNotify('当前预览环境没有连接到桌面后端。', 'error')
+    const next = Number(portValue)
+    if (!Number.isInteger(next) || next < 1 || next > 65535) return onNotify('端口必须是 1 到 65535 之间的整数。', 'error')
+    setPortWorking(true)
+    try {
+      await backend.SetListenPort(next)
+      setPortValue(String(next))
+      setPortDirty(false)
+      onNotify(`代理端口已切换为 ${next}，请同步更新 ZeroOmega。`, 'success')
+    } catch (error) {
+      onNotify(`修改代理端口失败：${errorText(error)}`, 'error')
+    } finally { setPortWorking(false) }
+  }
+
+  const changeCloseBehavior = async (value: 'tray' | 'exit') => {
+    if (!backend?.SetCloseBehavior) return onNotify('当前预览环境没有连接到桌面后端。', 'error')
+    setCloseWorking(true)
+    try {
+      await backend.SetCloseBehavior(value)
+      setCloseBehavior(value)
+      onNotify(value === 'tray' ? '关闭窗口将隐藏到系统托盘。' : '关闭窗口将退出程序并停止服务。', 'success')
+    } catch (error) {
+      onNotify(`修改关闭行为失败：${errorText(error)}`, 'error')
+    } finally { setCloseWorking(false) }
+  }
+
+  return <div className="page-grid"><section className="panel large-panel settings-panel"><div className="panel-heading"><div><span className="section-label">APPLICATION</span><h2>设置</h2></div></div><div className="detail-list"><div><span>版本</span><strong>1.0.1</strong></div><div className="setting-edit-row"><div><span>本地代理端口</span><small>监听地址固定为 127.0.0.1；修改后请同步 ZeroOmega 端口。</small></div><div className="port-control"><span>127.0.0.1:</span><input aria-label="本地代理端口" className="setting-input" type="number" min={1} max={65535} value={portValue} onChange={(event) => { setPortValue(event.target.value); setPortDirty(true) }} /><button className="secondary-button" onClick={() => void applyPort()} disabled={portWorking || !portDirty}>{portWorking ? '应用中…' : '应用'}</button></div></div><div><span>缓存路径</span><strong title={snapshot.cache_root}>{snapshot.cache_root || '—'}</strong></div><div><span>配置文件</span><strong>%LOCALAPPDATA%\GBFLocalCache\config.json</strong></div></div><div className="setting-list"><div className="setting-row"><div><strong>开机自启</strong><small>登录 Windows 后自动启动服务，并隐藏到右下角托盘。</small></div><button className={`switch-control ${startupEnabled ? 'active' : ''}`} role="switch" aria-checked={startupEnabled} onClick={() => void toggleStartup()} disabled={startupWorking}><span /></button></div><div className="setting-row"><div><strong>关闭窗口</strong><small>{closeBehavior === 'tray' ? '点击右上角 X 隐藏到系统托盘，服务继续运行。' : '点击右上角 X 退出程序并停止服务。'}</small></div><select aria-label="关闭窗口行为" className="setting-select" value={closeBehavior} onChange={(event) => void changeCloseBehavior(event.target.value as 'tray' | 'exit')} disabled={closeWorking}><option value="tray">隐藏到托盘</option><option value="exit">退出程序</option></select></div></div><div className="action-row"><button className="secondary-button" onClick={onOpenConfigFolder}><ExternalLink size={16} />打开配置目录</button><button className="secondary-button" onClick={onThemeChange}>{theme === 'light' ? <Moon size={16} /> : <Sun size={16} />}{theme === 'light' ? '切换深色主题' : '切换浅色主题'}</button><button className="secondary-button" onClick={() => onNotify('配置写入采用临时文件、flush、fsync 后原子替换。', 'success')}><Settings size={16} />配置说明</button></div></section></div>
 }
 
 export default App

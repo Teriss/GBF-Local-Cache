@@ -26,6 +26,10 @@ export function ClearLogs() {
   return window['go']['main']['App']['ClearLogs']();
 }
 
+export function GetCloseBehavior() {
+  return window['go']['main']['App']['GetCloseBehavior']();
+}
+
 export function GetStartupEnabled() {
   return window['go']['main']['App']['GetStartupEnabled']();
 }
@@ -60,6 +64,14 @@ export function RegenerateCertificate() {
 
 export function ResumeMigration() {
   return window['go']['main']['App']['ResumeMigration']();
+}
+
+export function SetCloseBehavior(arg1) {
+  return window['go']['main']['App']['SetCloseBehavior'](arg1);
+}
+
+export function SetListenPort(arg1) {
+  return window['go']['main']['App']['SetListenPort'](arg1);
 }
 
 export function SetNetworkMode(arg1, arg2, arg3, arg4, arg5, arg6) {

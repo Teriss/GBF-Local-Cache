@@ -138,6 +138,7 @@ type trayWndClassEx struct {
 
 type trayController struct {
 	ctx       context.Context
+	quit      func()
 	mu        sync.Mutex
 	hwnd      uintptr
 	className *uint16
@@ -151,6 +152,7 @@ type trayController struct {
 func (a *App) startTray(ctx context.Context) {
 	controller := &trayController{
 		ctx:   ctx,
+		quit:  a.forceQuit,
 		ready: make(chan struct{}),
 		done:  make(chan struct{}),
 	}
@@ -339,6 +341,10 @@ func (t *trayController) showMenu() {
 	case trayMenuOpen:
 		wailsruntime.WindowShow(t.ctx)
 	case trayMenuExit:
-		wailsruntime.Quit(t.ctx)
+		if t.quit != nil {
+			t.quit()
+		} else {
+			wailsruntime.Quit(t.ctx)
+		}
 	}
 }

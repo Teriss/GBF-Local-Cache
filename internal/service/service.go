@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -53,6 +55,7 @@ type Service struct {
 	lastError string
 	config    config.Config
 	listener  *proxy.Listener
+	handler   *proxy.Server
 	origin    *network.Manager
 	cache     *cache.Manager
 	ca        *cert.Manager
@@ -152,6 +155,7 @@ func (s *Service) Start(ctx context.Context) error {
 	s.ca = ca
 	s.migration = migrator
 	s.listener = listener
+	s.handler = core
 	s.state = StateRunning
 	s.lastError = ""
 	s.mu.Unlock()
@@ -233,6 +237,7 @@ func (s *Service) Stop(ctx context.Context) error {
 
 	s.mu.Lock()
 	s.listener = nil
+	s.handler = nil
 	s.origin = nil
 	s.cache = manager
 	s.migration = migrator
@@ -329,6 +334,66 @@ func (s *Service) SetConfig(cfg config.Config) error {
 	s.mu.Lock()
 	s.config = cfg
 	s.mu.Unlock()
+	return nil
+}
+
+// ChangeListenPort rebinds the loopback listener without rebuilding the
+// origin network, cache manager, certificate manager, or migration state.
+func (s *Service) ChangeListenPort(ctx context.Context, port int) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if port < 1 || port > 65535 {
+		return errors.New("listen port must be between 1 and 65535")
+	}
+	newAddress := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
+
+	s.mu.RLock()
+	oldAddress := s.config.ListenAddress
+	listener := s.listener
+	handler := s.handler
+	state := s.state
+	s.mu.RUnlock()
+	if oldAddress == newAddress {
+		return nil
+	}
+	if state == StateStarting || state == StateStopping {
+		return errors.New("service is busy")
+	}
+	if listener == nil || handler == nil {
+		s.mu.Lock()
+		s.config.ListenAddress = newAddress
+		s.mu.Unlock()
+		return nil
+	}
+
+	if err := listener.Shutdown(ctx); err != nil {
+		return fmt.Errorf("stop proxy listener: %w", err)
+	}
+	newListener, err := proxy.StartListener(newAddress, handler)
+	if err != nil {
+		restored, restoreErr := proxy.StartListener(oldAddress, handler)
+		s.mu.Lock()
+		if restoreErr == nil {
+			s.listener = restored
+		} else {
+			s.listener = nil
+			s.state = StateError
+			s.lastError = fmt.Sprintf("change listen port failed: %v; restore old listener failed: %v", err, restoreErr)
+		}
+		s.mu.Unlock()
+		if restoreErr != nil {
+			return fmt.Errorf("change listen port: %w; restore old listener: %v", err, restoreErr)
+		}
+		return fmt.Errorf("change listen port: %w", err)
+	}
+
+	s.mu.Lock()
+	s.listener = newListener
+	s.config.ListenAddress = newAddress
+	s.lastError = ""
+	s.mu.Unlock()
+	s.logs.Add(logging.Entry{Category: logging.CategoryNetwork, Message: "listen address changed to " + newAddress})
 	return nil
 }
 

@@ -5,6 +5,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -39,6 +40,61 @@ func TestServiceLifecycle(t *testing.T) {
 	if got := svc.Snapshot().State; got != StateStopped {
 		t.Fatalf("state after Stop = %q, want %q", got, StateStopped)
 	}
+}
+
+func TestChangeListenPortWhileRunning(t *testing.T) {
+	first := freeLoopbackAddress(t)
+	second := freeLoopbackAddress(t)
+	cfg := config.Default()
+	cfg.CacheRoot = t.TempDir()
+	cfg.ListenAddress = first
+	svc, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	defer func() { _ = svc.Stop(context.Background()) }()
+
+	secondPort := portFromAddress(t, second)
+	if err := svc.ChangeListenPort(context.Background(), secondPort); err != nil {
+		t.Fatalf("ChangeListenPort() error = %v", err)
+	}
+	if got := svc.Snapshot().ListenAddress; got != second {
+		t.Fatalf("listen address = %q, want %q", got, second)
+	}
+	connection, err := net.DialTimeout("tcp", second, time.Second)
+	if err != nil {
+		t.Fatalf("new listener is not reachable: %v", err)
+	}
+	_ = connection.Close()
+}
+
+func freeLoopbackAddress(t *testing.T) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return address
+}
+
+func portFromAddress(t *testing.T, address string) int {
+	t.Helper()
+	_, portText, err := net.SplitHostPort(address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return port
 }
 
 func TestChangeCacheRootWhileStoppedRenamesSameVolume(t *testing.T) {

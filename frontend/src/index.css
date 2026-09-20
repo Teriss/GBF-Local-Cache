@@ -161,6 +161,17 @@ code { padding: 3px 6px; border-radius: 7px; color: #44558a; background: #eef1fa
 .setting-row strong { color: #34425b; font-size: 13px; }
 .setting-row small { margin-top: 5px; color: #8b98ad; font-size: 11px; }
 .setting-value { color: #657590; font-size: 12px; }
+.setting-edit-row { display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 17px 0; border-bottom: 1px solid #edf0f5; }
+.setting-edit-row > div:first-child { min-width: 0; }
+.setting-edit-row span, .setting-edit-row small { display: block; }
+.setting-edit-row span { color: #657590; font-size: 12px; }
+.setting-edit-row small { margin-top: 5px; color: #8b98ad; font-size: 11px; }
+.port-control { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
+.port-control > span { color: #657590; font-size: 12px; }
+.setting-input, .setting-select { min-width: 0; padding: 9px 10px; border: 1px solid #dfe5f0; border-radius: 11px; outline: none; color: #34425b; background: #fff; font: inherit; font-size: 12px; }
+.setting-input { width: 90px; }
+.setting-select { min-width: 128px; cursor: pointer; }
+.setting-input:focus, .setting-select:focus { border-color: #7d91e5; box-shadow: 0 0 0 4px rgba(77, 104, 210, .12); }
 .switch-control { position: relative; width: 48px; height: 28px; flex: 0 0 auto; padding: 3px; border: 0; border-radius: 999px; background: #d6dce7; cursor: pointer; transition: .18s ease; }
 .switch-control span { display: block; width: 22px; height: 22px; border-radius: 50%; background: #fff; box-shadow: 0 2px 5px rgba(27, 42, 73, .18); transition: transform .18s ease; }
 .switch-control.active { background: #4b67dd; }
@@ -179,8 +190,11 @@ html[data-theme='dark'] .content { background: #101624; }
 html[data-theme='dark'] .panel, html[data-theme='dark'] .metric-card { border-color: #27334a; background: rgba(23, 32, 51, .9); box-shadow: none; }
 html[data-theme='dark'] h1, html[data-theme='dark'] h2, html[data-theme='dark'] .panel-heading h2, html[data-theme='dark'] .panel-heading h3, html[data-theme='dark'] .metric-card strong, html[data-theme='dark'] .chart-summary strong { color: #e9eefb; }
 html[data-theme='dark'] .muted, html[data-theme='dark'] .detail-list > div, html[data-theme='dark'] .metric-label, html[data-theme='dark'] .metric-card small, html[data-theme='dark'] .chart-summary span, html[data-theme='dark'] .source-meta, html[data-theme='dark'] .chart-footnote { color: #9aa9c1; }
-html[data-theme='dark'] .detail-list > div, html[data-theme='dark'] .setting-list, html[data-theme='dark'] .setting-row { border-color: #29354b; }
+html[data-theme='dark'] .detail-list > div, html[data-theme='dark'] .setting-list, html[data-theme='dark'] .setting-row, html[data-theme='dark'] .setting-edit-row { border-color: #29354b; }
 html[data-theme='dark'] .detail-list strong, html[data-theme='dark'] .source-meta strong, html[data-theme='dark'] .setting-row strong { color: #d4ddef; }
+html[data-theme='dark'] .setting-edit-row span { color: #b5c1d8; }
+html[data-theme='dark'] .setting-edit-row small { color: #9aa9c1; }
+html[data-theme='dark'] .setting-input, html[data-theme='dark'] .setting-select { border-color: #33415b; color: #d4ddef; background: #202c42; }
 html[data-theme='dark'] .icon-button, html[data-theme='dark'] .secondary-button { border-color: #33415b; color: #b5c1d8; background: #202c42; }
 html[data-theme='dark'] .radio { border-color: #33415b; background: #172033; }
 html[data-theme='dark'] .radio.active { border-color: #637ee0; background: #202d52; }
@@ -199,4 +213,6 @@ html[data-theme='dark'] .donut-track { stroke: #33415b; }
   .content { padding: 28px 30px 45px; }
   .sidebar { width: 215px; }
   .chart-layout { gap: 18px; }
+  .setting-edit-row { align-items: flex-start; flex-direction: column; }
+  .port-control { width: 100%; }
 }

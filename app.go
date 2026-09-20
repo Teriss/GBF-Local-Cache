@@ -24,12 +24,13 @@ import (
 // rather than the cache/proxy implementation, so the UI cannot couple itself
 // to backend goroutines.
 type App struct {
-	mu       sync.RWMutex
-	ctx      context.Context
-	config   config.Config
-	service  *service.Service
-	initErr  string
-	trayStop func()
+	mu            sync.RWMutex
+	ctx           context.Context
+	config        config.Config
+	service       *service.Service
+	initErr       string
+	trayStop      func()
+	quitRequested bool
 }
 
 type ConnectionTestResult struct {
@@ -99,6 +100,36 @@ func (a *App) shutdown(ctx context.Context) {
 		_ = svc.Stop(ctx)
 	}
 	a.stopTray()
+}
+
+// beforeClose implements the user-selected close behavior. Wails invokes this
+// callback for both the window close button and runtime.Quit, so tray exit sets
+// quitRequested first to bypass the hide-to-tray preference.
+func (a *App) beforeClose(ctx context.Context) bool {
+	a.mu.Lock()
+	if a.quitRequested {
+		a.quitRequested = false
+		a.mu.Unlock()
+		return false
+	}
+	behavior := a.config.CloseBehavior
+	a.mu.Unlock()
+
+	if behavior == config.CloseBehaviorTray && runtime.GOOS == "windows" {
+		wailsruntime.WindowHide(ctx)
+		return true
+	}
+	return false
+}
+
+func (a *App) forceQuit() {
+	a.mu.Lock()
+	a.quitRequested = true
+	ctx := a.ctx
+	a.mu.Unlock()
+	if ctx != nil {
+		wailsruntime.Quit(ctx)
+	}
 }
 
 // Snapshot is called by the overview page. The method returns a serializable
@@ -387,6 +418,60 @@ func (a *App) GetStartupEnabled() (bool, error) {
 // the tray without opening the control panel.
 func (a *App) SetStartupEnabled(enabled bool) error {
 	return setStartupEnabled(enabled)
+}
+
+// GetCloseBehavior returns the action used when the main window is closed.
+func (a *App) GetCloseBehavior() (string, error) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if a.service == nil {
+		return "", fmt.Errorf("service is not initialized")
+	}
+	return string(a.config.CloseBehavior), nil
+}
+
+// SetCloseBehavior persists the action used by the main window close button.
+func (a *App) SetCloseBehavior(behavior string) error {
+	value := config.CloseBehavior(behavior)
+	if value != config.CloseBehaviorTray && value != config.CloseBehaviorExit {
+		return fmt.Errorf("unsupported close behavior %q", behavior)
+	}
+	a.mu.RLock()
+	svc := a.service
+	a.mu.RUnlock()
+	if svc == nil {
+		return fmt.Errorf("service is not initialized")
+	}
+	cfg := svc.Config()
+	cfg.CloseBehavior = value
+	if err := svc.SetConfig(cfg); err != nil {
+		return err
+	}
+	a.syncPersistedConfig(cfg)
+	return nil
+}
+
+// SetListenPort changes the loopback proxy port and persists it. When the
+// service is running, only the HTTP listener is rebound; cache and TLS state
+// stay alive.
+func (a *App) SetListenPort(port int) error {
+	a.mu.RLock()
+	svc := a.service
+	ctx := a.ctx
+	a.mu.RUnlock()
+	if svc == nil {
+		return fmt.Errorf("service is not initialized")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	changeContext, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	if err := svc.ChangeListenPort(changeContext, port); err != nil {
+		return err
+	}
+	a.syncPersistedConfig(svc.Config())
+	return nil
 }
 
 func (a *App) CertificateStatus() cert.Status {

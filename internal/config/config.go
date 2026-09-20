@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"gbf-local-cache/internal/host"
@@ -21,6 +22,13 @@ const (
 	NetworkModeClash  NetworkMode = "clash"
 )
 
+type CloseBehavior string
+
+const (
+	CloseBehaviorTray CloseBehavior = "tray"
+	CloseBehaviorExit CloseBehavior = "exit"
+)
+
 type ClashConfig struct {
 	Protocol string `json:"protocol"`
 	Host     string `json:"host"`
@@ -30,14 +38,15 @@ type ClashConfig struct {
 }
 
 type Config struct {
-	Version       int         `json:"version"`
-	ListenAddress string      `json:"listen_address"`
-	CacheRoot     string      `json:"cache_root"`
-	RAMCacheMB    int         `json:"ram_cache_mb"`
-	RAMObjectMB   int         `json:"ram_object_mb"`
-	NetworkMode   NetworkMode `json:"network_mode"`
-	Clash         ClashConfig `json:"clash"`
-	AllowedHosts  []string    `json:"allowed_hosts"`
+	Version       int           `json:"version"`
+	ListenAddress string        `json:"listen_address"`
+	CacheRoot     string        `json:"cache_root"`
+	RAMCacheMB    int           `json:"ram_cache_mb"`
+	RAMObjectMB   int           `json:"ram_object_mb"`
+	NetworkMode   NetworkMode   `json:"network_mode"`
+	Clash         ClashConfig   `json:"clash"`
+	AllowedHosts  []string      `json:"allowed_hosts"`
+	CloseBehavior CloseBehavior `json:"close_behavior"`
 }
 
 func Default() Config {
@@ -48,6 +57,7 @@ func Default() Config {
 		RAMCacheMB:    256,
 		RAMObjectMB:   8,
 		NetworkMode:   NetworkModeDirect,
+		CloseBehavior: CloseBehaviorTray,
 		Clash: ClashConfig{
 			Protocol: "http",
 			Host:     "127.0.0.1",
@@ -101,6 +111,9 @@ func LoadOrCreate(path string) (Config, error) {
 	}
 	if cfg.RAMObjectMB == 0 {
 		cfg.RAMObjectMB = 8
+	}
+	if cfg.CloseBehavior == "" {
+		cfg.CloseBehavior = CloseBehaviorTray
 	}
 	if err := Validate(cfg); err != nil {
 		return Config{}, err
@@ -169,6 +182,9 @@ func Validate(cfg Config) error {
 	if cfg.NetworkMode != NetworkModeDirect && cfg.NetworkMode != NetworkModeClash {
 		return fmt.Errorf("unsupported network mode %q", cfg.NetworkMode)
 	}
+	if cfg.CloseBehavior != CloseBehaviorTray && cfg.CloseBehavior != CloseBehaviorExit {
+		return fmt.Errorf("unsupported close behavior %q", cfg.CloseBehavior)
+	}
 	if cfg.CacheRoot == "" {
 		return fmt.Errorf("cache root must not be empty")
 	}
@@ -226,6 +242,10 @@ func validateLoopbackListenAddress(address string) error {
 	}
 	if port == "" {
 		return fmt.Errorf("listen port is empty")
+	}
+	portNumber, err := strconv.Atoi(port)
+	if err != nil || portNumber < 1 || portNumber > 65535 {
+		return fmt.Errorf("listen port %q must be between 1 and 65535", port)
 	}
 	return nil
 }

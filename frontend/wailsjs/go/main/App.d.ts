@@ -18,6 +18,8 @@ export function ClearCache():Promise<void>;
 
 export function ClearLogs():Promise<void>;
 
+export function GetCloseBehavior():Promise<string>;
+
 export function GetStartupEnabled():Promise<boolean>;
 
 export function InspectCache():Promise<cache.HealthReport>;
@@ -35,6 +37,10 @@ export function PauseMigration():Promise<void>;
 export function RegenerateCertificate():Promise<void>;
 
 export function ResumeMigration():Promise<void>;
+
+export function SetCloseBehavior(arg1:string):Promise<void>;
+
+export function SetListenPort(arg1:number):Promise<void>;
 
 export function SetNetworkMode(arg1:string,arg2:string,arg3:string,arg4:number,arg5:string,arg6:string):Promise<void>;
 

@@ -28,12 +28,13 @@ func main() {
 		MinWidth:          980,
 		MinHeight:         620,
 		StartHidden:       startHidden,
-		HideWindowOnClose: true,
+		HideWindowOnClose: false,
 		AssetServer: &assetserver.Options{
 			Assets: frontendAssets,
 		},
-		OnStartup:  app.startup,
-		OnShutdown: app.shutdown,
+		OnStartup:     app.startup,
+		OnBeforeClose: app.beforeClose,
+		OnShutdown:    app.shutdown,
 		Bind: []interface{}{
 			app,
 		},
