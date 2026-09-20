@@ -1,0 +1,577 @@
+package migration
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"gbf-local-cache/internal/cache"
+	"gbf-local-cache/internal/logging"
+)
+
+// State describes the lifecycle of an online cache migration.
+type State string
+
+const (
+	StateIdle      State = "idle"
+	StateRunning   State = "running"
+	StatePaused    State = "paused"
+	StateCompleted State = "completed"
+	StateCanceled  State = "canceled"
+	StateError     State = "error"
+)
+
+// Status is deliberately made of plain JSON values so it can be exposed by
+// the Wails service snapshot without leaking migration internals to the UI.
+type Status struct {
+	State               State     `json:"state"`
+	OldRoot             string    `json:"old_root,omitempty"`
+	NewRoot             string    `json:"new_root,omitempty"`
+	TotalBytes          int64     `json:"total_bytes"`
+	CopiedBytes         int64     `json:"copied_bytes"`
+	TotalFiles          int64     `json:"total_files"`
+	CopiedFiles         int64     `json:"copied_files"`
+	SpeedBytesPerSecond int64     `json:"speed_bytes_per_second"`
+	CurrentFile         string    `json:"current_file,omitempty"`
+	Error               string    `json:"error,omitempty"`
+	StartedAt           time.Time `json:"started_at,omitempty"`
+	FinishedAt          time.Time `json:"finished_at,omitempty"`
+}
+
+type fileRecord struct {
+	Relative string
+	Size     int64
+}
+
+type persistedState struct {
+	Status  Status    `json:"status"`
+	SavedAt time.Time `json:"saved_at"`
+}
+
+// Manager copies cache objects while the cache RootSet is already configured
+// as New(primary) + Old(fallback). New writes therefore continue during the
+// copy, and a hit from the old root can be lazily promoted by cache.Manager.
+type Manager struct {
+	mu       sync.RWMutex
+	roots    *cache.RootSet
+	logs     *logging.Ring
+	status   Status
+	cancel   context.CancelFunc
+	done     chan struct{}
+	paused   bool
+	wake     chan struct{}
+	callback func(Status)
+}
+
+func New(roots *cache.RootSet, logs *logging.Ring) *Manager {
+	if logs == nil {
+		logs = logging.NewRing(5000)
+	}
+	return &Manager{roots: roots, logs: logs, status: Status{State: StateIdle}}
+}
+
+func (m *Manager) Status() Status {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.status
+}
+
+func (m *Manager) Roots() *cache.RootSet {
+	return m.roots
+}
+
+// Start validates and begins an online migration. The file scan is performed
+// before switching roots, so a malformed source or an invalid target cannot
+// leave the service in a half-switched state.
+func (m *Manager) Start(parent context.Context, oldRoot, newRoot string, callback func(Status)) error {
+	if parent == nil {
+		parent = context.Background()
+	}
+	oldRoot, err := absoluteClean(oldRoot)
+	if err != nil {
+		return fmt.Errorf("old cache root: %w", err)
+	}
+	newRoot, err = absoluteClean(newRoot)
+	if err != nil {
+		return fmt.Errorf("new cache root: %w", err)
+	}
+	if samePath(oldRoot, newRoot) {
+		return errors.New("new cache root is the same as the current root")
+	}
+	if pathContains(oldRoot, newRoot) || pathContains(newRoot, oldRoot) {
+		return errors.New("cache roots cannot contain one another")
+	}
+	if m.roots == nil {
+		return errors.New("migration root set is not initialized")
+	}
+	if err := ensureWritableDirectory(newRoot); err != nil {
+		return fmt.Errorf("new cache root is not writable: %w", err)
+	}
+
+	m.mu.Lock()
+	if m.cancel != nil {
+		m.mu.Unlock()
+		return errors.New("cache migration is already running")
+	}
+	m.mu.Unlock()
+
+	files, totalBytes, err := scanFiles(oldRoot)
+	if err != nil {
+		return fmt.Errorf("scan old cache root: %w", err)
+	}
+	ctx, cancel := context.WithCancel(parent)
+	m.mu.Lock()
+	m.cancel = cancel
+	m.done = make(chan struct{})
+	m.paused = false
+	m.wake = make(chan struct{})
+	m.callback = callback
+	m.status = Status{
+		State:      StateRunning,
+		OldRoot:    oldRoot,
+		NewRoot:    newRoot,
+		TotalBytes: totalBytes,
+		TotalFiles: int64(len(files)),
+		StartedAt:  time.Now().UTC(),
+	}
+	done := m.done
+	m.mu.Unlock()
+
+	// From this point every new cache write goes to the destination. Reads
+	// still fall back to the source until FinishMigration is called.
+	m.roots.BeginMigration(newRoot, oldRoot)
+	m.log(logging.CategoryMigration, "started: "+oldRoot+" -> "+newRoot)
+	m.persist()
+	go m.run(ctx, done, files)
+	return nil
+}
+
+// Recover resumes a migration whose process was interrupted. The old root is
+// still the configured root after an interrupted run, so it remains safe to
+// serve from it while the destination is rebuilt and verified.
+func (m *Manager) Recover(parent context.Context, configuredOldRoot string, callback func(Status)) (bool, error) {
+	configuredOldRoot, err := absoluteClean(configuredOldRoot)
+	if err != nil {
+		return false, err
+	}
+	data, err := os.ReadFile(filepath.Join(configuredOldRoot, "state", "migration.json"))
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	var saved persistedState
+	if err := json.Unmarshal(data, &saved); err != nil {
+		return false, fmt.Errorf("decode migration state: %w", err)
+	}
+	if saved.Status.State != StateRunning && saved.Status.State != StatePaused {
+		return false, nil
+	}
+	if saved.Status.OldRoot == "" || saved.Status.NewRoot == "" {
+		return false, errors.New("migration state has incomplete roots")
+	}
+	if !samePath(saved.Status.OldRoot, configuredOldRoot) {
+		return false, errors.New("migration state does not belong to the configured cache root")
+	}
+	if err := m.Start(parent, saved.Status.OldRoot, saved.Status.NewRoot, callback); err != nil {
+		return false, err
+	}
+	m.log(logging.CategoryMigration, "resumed migration after process restart")
+	return true, nil
+}
+
+func (m *Manager) run(ctx context.Context, done chan struct{}, files []fileRecord) {
+	defer close(done)
+	started := time.Now()
+	for _, file := range files {
+		if err := m.waitIfPaused(ctx); err != nil {
+			m.finishCanceled(err)
+			return
+		}
+		m.setCurrent(file.Relative)
+		source := filepath.Join(m.statusRoots().old, file.Relative)
+		destination := filepath.Join(m.statusRoots().new, file.Relative)
+		if err := copyAndVerify(ctx, source, destination, file.Size); err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
+				m.finishCanceled(err)
+			} else {
+				m.finishError(err)
+			}
+			return
+		}
+		m.mu.Lock()
+		m.status.CopiedFiles++
+		m.status.CopiedBytes += file.Size
+		elapsed := time.Since(started)
+		if elapsed > 0 {
+			m.status.SpeedBytesPerSecond = int64(float64(m.status.CopiedBytes) / elapsed.Seconds())
+		}
+		m.mu.Unlock()
+		m.persist()
+	}
+
+	if err := verifyMigration(m.statusRoots().new, files); err != nil {
+		m.finishError(err)
+		return
+	}
+	m.roots.FinishMigration()
+	m.mu.Lock()
+	m.status.State = StateCompleted
+	m.status.CurrentFile = ""
+	m.status.FinishedAt = time.Now().UTC()
+	m.status.Error = ""
+	callback := m.callback
+	m.cancel = nil
+	m.callback = nil
+	m.mu.Unlock()
+	m.persist()
+	m.log(logging.CategoryMigration, "completed")
+	if callback != nil {
+		callback(m.Status())
+	}
+}
+
+func (m *Manager) Pause() error {
+	m.mu.Lock()
+	if m.cancel == nil || m.status.State != StateRunning {
+		m.mu.Unlock()
+		return errors.New("cache migration is not running")
+	}
+	m.paused = true
+	m.status.State = StatePaused
+	m.mu.Unlock()
+	m.persist()
+	return nil
+}
+
+func (m *Manager) Resume() error {
+	m.mu.Lock()
+	if m.cancel == nil || m.status.State != StatePaused {
+		m.mu.Unlock()
+		return errors.New("cache migration is not paused")
+	}
+	m.paused = false
+	m.status.State = StateRunning
+	close(m.wake)
+	m.wake = make(chan struct{})
+	m.mu.Unlock()
+	m.persist()
+	return nil
+}
+
+func (m *Manager) Cancel() error {
+	m.mu.RLock()
+	cancel := m.cancel
+	m.mu.RUnlock()
+	if cancel == nil {
+		return errors.New("cache migration is not running")
+	}
+	cancel()
+	return nil
+}
+
+func (m *Manager) Wait(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	m.mu.RLock()
+	done := m.done
+	m.mu.RUnlock()
+	if done == nil {
+		return nil
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (m *Manager) Close(ctx context.Context) error {
+	_ = m.Cancel()
+	return m.Wait(ctx)
+}
+
+func (m *Manager) waitIfPaused(ctx context.Context) error {
+	for {
+		m.mu.RLock()
+		paused, wake := m.paused, m.wake
+		m.mu.RUnlock()
+		if !paused {
+			return nil
+		}
+		select {
+		case <-wake:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func (m *Manager) setCurrent(relative string) {
+	m.mu.Lock()
+	m.status.CurrentFile = relative
+	m.mu.Unlock()
+	m.persist()
+}
+
+type rootsSnapshot struct {
+	old string
+	new string
+}
+
+func (m *Manager) statusRoots() rootsSnapshot {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return rootsSnapshot{old: m.status.OldRoot, new: m.status.NewRoot}
+}
+
+func (m *Manager) finishCanceled(err error) {
+	m.roots.RestoreFallback()
+	m.finish(StateCanceled, err)
+}
+
+func (m *Manager) finishError(err error) {
+	m.roots.RestoreFallback()
+	m.finish(StateError, err)
+}
+
+func (m *Manager) finish(state State, err error) {
+	m.mu.Lock()
+	m.status.State = state
+	m.status.CurrentFile = ""
+	m.status.FinishedAt = time.Now().UTC()
+	if err != nil && !errors.Is(err, context.Canceled) {
+		m.status.Error = err.Error()
+	}
+	callback := m.callback
+	m.cancel = nil
+	m.callback = nil
+	m.mu.Unlock()
+	m.persist()
+	m.log(logging.CategoryMigration, fmt.Sprintf("%s: %v", state, err))
+	if callback != nil {
+		callback(m.Status())
+	}
+}
+
+func (m *Manager) persist() {
+	status := m.Status()
+	if status.NewRoot == "" {
+		return
+	}
+	payload, err := json.MarshalIndent(persistedState{Status: status, SavedAt: time.Now().UTC()}, "", "  ")
+	if err != nil {
+		return
+	}
+	payload = append(payload, '\n')
+	_ = atomicWrite(filepath.Join(status.NewRoot, "state", "migration.json"), payload, 0o600)
+	if status.OldRoot != "" {
+		_ = atomicWrite(filepath.Join(status.OldRoot, "state", "migration.json"), payload, 0o600)
+	}
+}
+
+func (m *Manager) log(category logging.Category, message string) {
+	if m.logs != nil {
+		m.logs.Add(logging.Entry{Category: category, Message: message})
+	}
+}
+
+func scanFiles(root string) ([]fileRecord, int64, error) {
+	var files []fileRecord
+	var total int64
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		relative, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		if relative == "." {
+			return nil
+		}
+		if entry.IsDir() {
+			if strings.EqualFold(filepath.ToSlash(relative), "state") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			return fmt.Errorf("symlink is not allowed in cache root: %s", relative)
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		files = append(files, fileRecord{Relative: relative, Size: info.Size()})
+		total += info.Size()
+		return nil
+	})
+	return files, total, err
+}
+
+func verifyMigration(root string, files []fileRecord) error {
+	for _, file := range files {
+		path := filepath.Join(root, file.Relative)
+		info, err := os.Stat(path)
+		if err != nil {
+			return fmt.Errorf("verify %s: %w", file.Relative, err)
+		}
+		if info.Size() != file.Size {
+			return fmt.Errorf("verify %s: size %d, want %d", file.Relative, info.Size(), file.Size)
+		}
+	}
+	return nil
+}
+
+func copyAndVerify(ctx context.Context, source, destination string, expectedSize int64) error {
+	if err := os.MkdirAll(filepath.Dir(destination), 0o700); err != nil {
+		return err
+	}
+	in, err := os.Open(source)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	tmp, err := os.CreateTemp(filepath.Dir(destination), ".migration-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	digest := sha256.New()
+	written, err := io.CopyBuffer(io.MultiWriter(tmp, digest), in, make([]byte, 128*1024))
+	if err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if written != expectedSize {
+		_ = tmp.Close()
+		return fmt.Errorf("copy size mismatch: got %d, want %d", written, expectedSize)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := replaceFile(tmpName, destination); err != nil {
+		return err
+	}
+	destinationDigest, err := hashFile(destination)
+	if err != nil {
+		return err
+	}
+	if destinationDigest != hex.EncodeToString(digest.Sum(nil)) {
+		return errors.New("migration checksum mismatch")
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+		return nil
+	}
+}
+
+func hashFile(path string) (string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	digest := sha256.New()
+	if _, err := io.Copy(digest, file); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(digest.Sum(nil)), nil
+}
+
+func replaceFile(source, destination string) error {
+	if err := os.Rename(source, destination); err == nil {
+		return nil
+	}
+	if err := os.Remove(destination); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return os.Rename(source, destination)
+}
+
+func ensureWritableDirectory(path string) error {
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		return err
+	}
+	test, err := os.CreateTemp(path, ".write-test-*.tmp")
+	if err != nil {
+		return err
+	}
+	name := test.Name()
+	if err := test.Close(); err != nil {
+		_ = os.Remove(name)
+		return err
+	}
+	return os.Remove(name)
+}
+
+func absoluteClean(path string) (string, error) {
+	if strings.TrimSpace(path) == "" {
+		return "", errors.New("path is empty")
+	}
+	abs, err := filepath.Abs(filepath.Clean(path))
+	if err != nil {
+		return "", err
+	}
+	return filepath.Clean(abs), nil
+}
+
+func samePath(left, right string) bool {
+	return strings.EqualFold(filepath.Clean(left), filepath.Clean(right))
+}
+
+func pathContains(parent, child string) bool {
+	relative, err := filepath.Rel(parent, child)
+	if err != nil || relative == "." {
+		return err == nil
+	}
+	return relative != ".." && !strings.HasPrefix(relative, ".."+string(os.PathSeparator))
+}
+
+func atomicWrite(path string, data []byte, mode os.FileMode) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".migration-state-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(mode); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return replaceFile(tmpName, path)
+}
