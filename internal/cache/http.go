@@ -143,6 +143,9 @@ func ifRangeMatches(request *http.Request, entry CacheEntry) bool {
 		return true
 	}
 	if strings.Contains(value, "\"") {
+		if strings.HasPrefix(value, "W/") || strings.HasPrefix(entry.ETag, "W/") {
+			return false
+		}
 		return value == entry.ETag
 	}
 	requested, err := http.ParseTime(value)

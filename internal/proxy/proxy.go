@@ -197,10 +197,28 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	s.stats.CacheableRequest()
 	outbound := cloneOriginRequest(request, target)
 	if s.cache != nil {
-		result, err := s.cache.Fetch(request.Context(), outbound)
+		served, err := s.cache.Serve(writer, outbound)
 		if err != nil {
+			if served.ClientDisconnected && served.FailureStage == "" {
+				s.log(logging.CategoryNetwork, request.Method, target, "browser disconnected before cache fill completed", started)
+				return
+			}
 			s.stats.Error()
-			s.log(logging.CategoryError, request.Method, target, "cache pipeline failed: "+err.Error(), started)
+			message := "cache pipeline failed: " + err.Error()
+			if served.FailureStage != "" {
+				message += "; stage=" + served.FailureStage
+			}
+			if served.Timing.OriginAttempted {
+				message += fmt.Sprintf("; origin_headers=%s origin_first_byte=%s download_done=%s browser_first_byte=%s",
+					served.Timing.OriginHeaders.Round(time.Millisecond), served.Timing.OriginFirstByte.Round(time.Millisecond),
+					served.Timing.DownloadDone.Round(time.Millisecond), served.Timing.BrowserFirstByte.Round(time.Millisecond))
+			}
+			s.log(logging.CategoryError, request.Method, target, message, started)
+			if served.Committed {
+				// A streamed response cannot be replaced with a 502. Closing the
+				// connection tells the browser that the body was incomplete.
+				panic(http.ErrAbortHandler)
+			}
 			if request.Context().Err() != nil {
 				return
 			}
@@ -211,8 +229,18 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 			s.stats.RangeRequest()
 			s.log(logging.CategoryRange, request.Method, target, "range response", started)
 		}
-		cache.WriteResult(writer, request, result)
-		s.logResponse(request, target, result.Entry.StatusCode, int64(len(result.Body)), started, string(result.Source))
+		message := fmt.Sprintf("%s %d, %d bytes", served.Result.Source, served.Result.Entry.StatusCode, served.Bytes)
+		if served.Timing.OriginAttempted {
+			message += fmt.Sprintf("; origin_headers=%s origin_first_byte=%s download_done=%s browser_first_byte=%s",
+				served.Timing.OriginHeaders.Round(time.Millisecond), served.Timing.OriginFirstByte.Round(time.Millisecond),
+				served.Timing.DownloadDone.Round(time.Millisecond), served.Timing.BrowserFirstByte.Round(time.Millisecond))
+		} else {
+			message += fmt.Sprintf("; browser_first_byte=%s", served.Timing.BrowserFirstByte.Round(time.Millisecond))
+		}
+		if served.ClientDisconnected {
+			message += "; browser_disconnected; cache_fill=complete"
+		}
+		s.log(logging.CategoryNetwork, request.Method, target, message, started)
 		return
 	}
 

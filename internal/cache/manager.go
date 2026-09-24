@@ -279,34 +279,8 @@ func (m *Manager) Fetch(ctx context.Context, request *http.Request) (Result, err
 	if err != nil {
 		return Result{}, err
 	}
-	if entry, body, ok := m.ram.Get(hash); ok {
-		m.stats.RamHit()
-		served := servedBytes(request, entry, body)
-		m.stats.AddCacheBytesServed(served)
-		m.stats.AddBytesSaved(served)
-		m.log(logging.CategoryHit, request, "RAM", len(body))
-		cached := Result{Key: hash, Canonical: canonical, Entry: entry, Body: body, Source: SourceRAM, Cacheable: true}
-		if request.Method == http.MethodGet && (RequestForcesRevalidate(request) || !IsFresh(entry, time.Now())) {
-			return m.revalidateCached(ctx, request, hash, canonical, cached)
-		}
-		return cached, nil
-	}
-	if entry, body, root, diskErr := m.disk.Read(hash); diskErr == nil {
-		m.stats.DiskHit()
-		served := servedBytes(request, entry, body)
-		m.stats.AddCacheBytesServed(served)
-		m.stats.AddBytesSaved(served)
-		m.ram.Put(hash, entry, body)
-		primary, _ := m.disk.Roots().Roots()
-		if root != primary {
-			m.promote(hash, entry, body)
-		}
-		m.log(logging.CategoryHit, request, "Disk", len(body))
-		cached := Result{Key: hash, Canonical: canonical, Entry: entry, Body: body, Source: SourceDisk, Cacheable: true}
-		if request.Method == http.MethodGet && (RequestForcesRevalidate(request) || !IsFresh(entry, time.Now())) {
-			return m.revalidateCached(ctx, request, hash, canonical, cached)
-		}
-		return cached, nil
+	if cached, ok, err := m.lookup(ctx, request, hash, canonical); ok || err != nil {
+		return cached, err
 	}
 	if request.Method == http.MethodHead {
 		// HEAD never creates a cache entry and does not participate in the
@@ -343,6 +317,41 @@ func (m *Manager) Fetch(ctx context.Context, request *http.Request) (Result, err
 		result.Source = SourceOrigin
 	}
 	return result, nil
+}
+
+func (m *Manager) lookup(ctx context.Context, request *http.Request, hash, canonical string) (Result, bool, error) {
+	if entry, body, ok := m.ram.Get(hash); ok {
+		m.stats.RamHit()
+		served := servedBytes(request, entry, body)
+		m.stats.AddCacheBytesServed(served)
+		m.stats.AddBytesSaved(served)
+		m.log(logging.CategoryHit, request, "RAM", len(body))
+		cached := Result{Key: hash, Canonical: canonical, Entry: entry, Body: body, Source: SourceRAM, Cacheable: true}
+		if request.Method == http.MethodGet && (RequestForcesRevalidate(request) || !IsFresh(entry, time.Now())) {
+			result, err := m.revalidateCached(ctx, request, hash, canonical, cached)
+			return result, true, err
+		}
+		return cached, true, nil
+	}
+	if entry, body, root, diskErr := m.disk.Read(hash); diskErr == nil {
+		m.stats.DiskHit()
+		served := servedBytes(request, entry, body)
+		m.stats.AddCacheBytesServed(served)
+		m.stats.AddBytesSaved(served)
+		m.ram.Put(hash, entry, body)
+		primary, _ := m.disk.Roots().Roots()
+		if root != primary {
+			m.promote(hash, entry, body)
+		}
+		m.log(logging.CategoryHit, request, "Disk", len(body))
+		cached := Result{Key: hash, Canonical: canonical, Entry: entry, Body: body, Source: SourceDisk, Cacheable: true}
+		if request.Method == http.MethodGet && (RequestForcesRevalidate(request) || !IsFresh(entry, time.Now())) {
+			result, err := m.revalidateCached(ctx, request, hash, canonical, cached)
+			return result, true, err
+		}
+		return cached, true, nil
+	}
+	return Result{}, false, nil
 }
 
 func (m *Manager) fetchOrigin(ctx context.Context, request *http.Request, hash, canonical string) (Result, error) {
@@ -394,8 +403,15 @@ func (m *Manager) fetchRevalidated(ctx context.Context, request *http.Request, h
 			entry.Headers = make(http.Header)
 		}
 		for key, values := range SanitizeHeaders(response.Header) {
-			if strings.EqualFold(key, "Content-Length") {
+			if strings.EqualFold(key, "Content-Length") || strings.EqualFold(key, "Content-Encoding") || strings.EqualFold(key, "Content-Md5") {
 				continue
+			}
+			if strings.EqualFold(key, "ETag") && strings.HasPrefix(cached.Entry.ETag, "W/") {
+				for index, value := range values {
+					if value != "" && !strings.HasPrefix(value, "W/") {
+						values[index] = "W/" + value
+					}
+				}
 			}
 			entry.Headers.Del(key)
 			for _, value := range values {
@@ -425,9 +441,10 @@ func (m *Manager) originRequest(ctx context.Context, request *http.Request, cach
 	for _, key := range []string{"Range", "If-Range", "If-None-Match", "If-Modified-Since", "If-Unmodified-Since", "If-Match", "Cookie", "Authorization", "Proxy-Authorization"} {
 		originRequest.Header.Del(key)
 	}
-	// Cache bytes are stored and served byte-for-byte. Asking for identity
-	// avoids treating a compressed representation as a decoded asset.
-	originRequest.Header.Set("Accept-Encoding", "identity")
+	// Request gzip consistently regardless of the browser's capabilities.
+	// Responses are decoded before serving or caching, so the URL remains the
+	// only cache key and local ranges address the decoded representation.
+	originRequest.Header.Set("Accept-Encoding", "gzip")
 	if cached != nil {
 		if cached.ETag != "" {
 			originRequest.Header.Set("If-None-Match", cached.ETag)
@@ -455,7 +472,13 @@ func (m *Manager) consumeOriginResponse(request *http.Request, hash, canonical s
 		m.stats.Error()
 		return Result{}, errors.New("origin returned an empty response")
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode == http.StatusOK {
+		if err := decodeOriginResponse(response); err != nil {
+			m.stats.Error()
+			return Result{}, err
+		}
+	}
 	if response.ContentLength > m.maxObjectSize {
 		m.stats.Error()
 		return Result{}, fmt.Errorf("origin object is larger than %d bytes", m.maxObjectSize)

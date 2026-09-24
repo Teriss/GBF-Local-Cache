@@ -64,3 +64,15 @@ func TestWriteResultSupportsValidatorsAndRange(t *testing.T) {
 		t.Fatalf("304 response = status %d, body length %d", notModifiedResponse.Code, notModifiedResponse.Body.Len())
 	}
 }
+
+func TestWeakETagDoesNotSatisfyIfRange(t *testing.T) {
+	entry := CacheEntry{StatusCode: http.StatusOK, Headers: make(http.Header), ETag: `W/"compressed-v1"`}
+	request := httptest.NewRequest(http.MethodGet, "https://static.example.test/app.js", nil)
+	request.Header.Set("Range", "bytes=0-2")
+	request.Header.Set("If-Range", `W/"compressed-v1"`)
+	response := httptest.NewRecorder()
+	WriteResult(response, request, Result{Entry: entry, Body: []byte("0123456789")})
+	if response.Code != http.StatusOK || response.Body.String() != "0123456789" {
+		t.Fatalf("weak If-Range response = %d %q", response.Code, response.Body.String())
+	}
+}

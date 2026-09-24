@@ -140,7 +140,8 @@ func buildHolder(cfg config.Config) (*clientHolder, error) {
 	}
 	switch cfg.NetworkMode {
 	case config.NetworkModeDirect:
-		// Proxy remains explicitly nil. This is the UU/system-direct mode.
+		// Proxy remains explicitly nil. UU accelerates this connection only if
+		// its routing configuration includes this process and origin.
 	case config.NetworkModeClash:
 		protocol := strings.ToLower(strings.TrimSpace(cfg.Clash.Protocol))
 		if protocol == "" {
